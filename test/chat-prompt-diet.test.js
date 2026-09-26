@@ -17,6 +17,12 @@ const src = fs.readFileSync(path.resolve(__dirname, '..', 'sidecar', 'index.js')
 const once = (needle, label) => { A.eq(src.split(needle).length - 1, 1, label + ' (exactly one occurrence)'); };
 
 once("if (isTask && resolved.tools.includes('team.dispatch')) {", 'the [ORCHESTRATION] briefing follows actual delegation authority on task turns');
+A.ok(/const isOverseerGuideRun = !internal && isTask && surface === 'interactive'[\s\S]{0,140}isCoordinatorRun/.test(src),
+   'task capability guidance is limited to interactive Overseer work');
+A.ok(/taskCapabilityGuidance\(resolved, latestUserText\(messages\), \{ surface, unrestrictedHost: unrestrictedHostNow\(\) \}\)/.test(src),
+   'task-specific recommendations use the current Commander request and resolved tool truth');
+A.ok(/\+ preloadedSkillBlock \+ serviceKeysBlock \+ taskIntentNote \+ directDomainBlock \+ journeyBlock \+ starnetGuideBlock \+ taskCapabilityBlock\s*\+ deliverableNote/.test(src),
+   'task-ranked guidance stays outside the reusable prompt-cache prefix');
 once("const manualBlock = (isTask && surface === 'interactive') ? starnetManual() : '';", 'the operator manual is gated on isTask');
 once("skillBlock = isTask", 'the skill recipe block is gated on isTask');
 once("if (isTask && resolved.tools.indexOf('skill.view') >= 0) {", 'the runtime skill index is gated on isTask');

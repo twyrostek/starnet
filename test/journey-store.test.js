@@ -19,7 +19,20 @@ const writeDurable = ({ fs }, file, data) => fs.writeFileSync(file, data);
 const fresh = fs => makeJourneyStore({ fs: fs || memFs(), path, workspaces: '/ws', writeDurable });
 
 (async () => {
-  A.eq(normalize(null), { goals: [], achievements: [], achievementKeys: [], commanderPoints: 0, v: 1, seq: 0, commanderEpoch: 0, startedAt: 0, metrics: [], outcomes: [], outcomeKeys: [], mastery: [], receipts: [], goalsReached: [], suppressed: {} }, 'missing journey state hydrates safely');
+  A.eq(normalize(null), {
+    goals: [], achievements: [], achievementKeys: [], commanderPoints: 0, v: 1, seq: 0, commanderEpoch: 0, startedAt: 0,
+    metrics: [], outcomes: [], outcomeKeys: [], mastery: [], receipts: [], goalsReached: [], suppressed: {},
+    starnet: {
+      milestones: {
+        recruited_first_specialist: { key: 'recruited_first_specialist', state: 'unknown', firstSuggestedAt: 0, lastSuggestedAt: 0, suggestedCount: 0, firstConfirmedAt: null, lastConfirmedAt: null, evidence: '', updatedAt: 0 },
+        delegated_background_task: { key: 'delegated_background_task', state: 'unknown', firstSuggestedAt: 0, lastSuggestedAt: 0, suggestedCount: 0, firstConfirmedAt: null, lastConfirmedAt: null, evidence: '', updatedAt: 0 },
+        created_first_routine: { key: 'created_first_routine', state: 'unknown', firstSuggestedAt: 0, lastSuggestedAt: 0, suggestedCount: 0, firstConfirmedAt: null, lastConfirmedAt: null, evidence: '', updatedAt: 0 },
+        connected_first_platform: { key: 'connected_first_platform', state: 'unknown', firstSuggestedAt: 0, lastSuggestedAt: 0, suggestedCount: 0, firstConfirmedAt: null, lastConfirmedAt: null, evidence: '', updatedAt: 0 }
+      },
+      suggestions: [],
+      updatedAt: 0
+    }
+  }, 'missing journey state hydrates safely');
   A.eq([tierFor(0), tierFor(1), tierFor(3), tierFor(7)], ['unproven', 'tested', 'practiced', 'proven'], 'mastery tiers cross only on verified outcome counts');
   A.eq(evolutionFor(['a', 'b']).name, 'ORBIT', 'station evolution is derived from distinct goals reached');
   A.eq(evolutionFor(Array.from({ length: 9 }, (_, i) => String(i))).stage, 9, 'station evolution remains uncapped across a long Commander journey');
@@ -62,6 +75,13 @@ const fresh = fs => makeJourneyStore({ fs: fs || memFs(), path, workspaces: '/ws
   A.ok(s.snapshot().receipts.filter(r => r.agentId === 'builder').every(r => r.dismissedAt === 300), 'suppression is visible on its receipts');
   await s.setSuppressed('builder', 'building', false, 301);
   A.ok(/building: 7 verified outcomes/.test(s.adaptationBlock('builder')), 'Commander can resume the corrected track');
+  await s.noteStarnetGuidance('created_first_routine', 'explained', 'Suggested ROUTINES for recurring work.', 302);
+  A.eq(s.snapshot().starnet.milestones.created_first_routine.state, 'explained', 'StarNet guidance persists a structured lesson state');
+  A.ok(/RECENTLY SUGGESTED STARNET LESSONS:[\s\S]*created_first_routine/.test(s.starnetGuideBlock()), 'the Overseer guide block includes recent StarNet guidance');
+  await s.confirmStarnetMilestone('delegated_background_task', 'Started delegated background work through team.dispatch.', 303);
+  const guide = s.starnetGuideBlock();
+  A.ok(/CONFIRMED STARNET MILESTONES:[\s\S]*delegated_background_task/.test(guide), 'confirmed StarNet milestones appear in the Overseer guide block');
+  A.ok(!/NEXT USEFUL STARNET LESSONS[\s\S]*delegated_background_task/.test(guide), 'confirmed StarNet milestones are removed from the suggested next-lesson list');
 
   const milestone = { goalId: 'goal:game', milestoneId: 'm:launch', milestoneText: 'Launch the playable game', evidence: 'Release build linked in the task', agentId: 'builder', domain: 'building', goalDone: true };
   A.ok((await s.recordMilestone(milestone, 400)).ok, 'a final work milestone records the completed action');
@@ -79,6 +99,7 @@ const fresh = fs => makeJourneyStore({ fs: fs || memFs(), path, workspaces: '/ws
   const restarted = fresh(fs);
   A.eq(restarted.snapshot().evolution.goalsReached, 2, 'metrics, mastery, receipts, and evolution survive process restart');
   A.eq(restarted.snapshot().mastery.find(m => m.agentId === 'builder').count, 8, 'restart preserves the exact verified mastery count');
+  A.eq(restarted.snapshot().starnet.milestones.delegated_background_task.state, 'confirmed', 'StarNet onboarding confirmations survive process restart');
   A.eq(Object.keys(restarted.snapshot()).includes('capabilities'), false, 'journey state has no capability/unlock field by construction');
 
   // Long-horizon invariants: visible history may be bounded, but idempotency, active user metrics, and the

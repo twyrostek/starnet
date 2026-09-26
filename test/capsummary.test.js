@@ -5,7 +5,7 @@
    host-granted/dynamic tools. */
 'use strict';
 const A = require('./_assert.js');
-const { summarizeCapabilities } = require('../sidecar/capability/capsummary.js');
+const { summarizeCapabilities, taskCapabilityGuidance } = require('../sidecar/capability/capsummary.js');
 
 // helper: a resolved-like object from a list of capIds (no tool list -> resolve by capId alone)
 const resolvedWith = (...capIds) => ({ grants: capIds.map((id) => ({ capId: id, tool: id + '.x' })) });
@@ -114,6 +114,19 @@ const resolvedTools = (capIds, tools) => ({
   A.ok(/search and control Spotify/.test(jukebox), 'jukebox present: listed under CAN');
   const conn = summarizeCapabilities({ grants: [], tools: ['mcp__github__list_issues'] }, { surface: 'interactive' });
   A.ok(/live MCP connector tools/.test(conn), 'dynamic MCP connector tools are acknowledged instead of hidden');
+
+  // 12) task-relevant recommendations use the same resolved grants/tools as the authoritative capability block.
+  const researchNeed = taskCapabilityGuidance(resolvedWith(), 'Research the latest news and compare sources.', { surface: 'interactive' });
+  A.ok(/TASK-RELEVANT STARNET CAPABILITIES/.test(researchNeed) && /recommend placing a DISH/.test(researchNeed),
+    'a web research task recommends the missing DISH');
+  A.ok(!/WORKBENCH/.test(researchNeed), 'irrelevant capabilities are not recommended for a web research task');
+  A.eq(taskCapabilityGuidance(resolvedWith(), 'What is the weather today?', { surface: 'interactive' }), '',
+    'generic questions without a strong capability signal do not trigger upgrade advice');
+  const codeAvailable = taskCapabilityGuidance(resolvedTools(['workbench'], ['shell.exec']), 'Implement this feature and run tests.', { surface: 'interactive' });
+  A.ok(/run shell commands and verify code is already available/.test(codeAvailable) && !/recommend placing a WORKBENCH/.test(codeAvailable),
+    'a relevant capability already present is never recommended as a missing upgrade');
+  const autonomous = taskCapabilityGuidance(resolvedWith(), 'Research current news.', { surface: 'autonomous' });
+  A.eq(autonomous, '', 'background surfaces do not suggest physical prop placement');
 
   A.report('capsummary.test');
 })();

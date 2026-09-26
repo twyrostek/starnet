@@ -189,6 +189,9 @@
 
   function makeRoutineTools(deps) {
     deps = deps || {};
+    const journeyStore = deps && deps.journeyStore && typeof deps.journeyStore.confirmStarnetMilestone === 'function'
+      ? deps.journeyStore
+      : null;
     const listJobs = typeof deps.listJobs === 'function' ? deps.listJobs : function () { return []; };
     const createRoutine = deps.createRoutine;
     // routine.manage's four store verbs. Kept as DISCRETE injected verbs (not one host-side `manage`) so the
@@ -351,6 +354,11 @@
           // W6: the plain "you already maintain: …" reminder so the model tracks what exists across turns.
           maintains: mintSummary(route.agentId) || undefined
         };
+        if (journeyStore) {
+          try {
+            await journeyStore.confirmStarnetMilestone('created_first_routine', 'Created StarNet routine "' + String(job && job.name || spec.name || 'Scheduled routine') + '" for ' + route.agentId + '.', Date.now());
+          } catch (_) {}
+        }
         return {
           content: JSON.stringify(body),
           summary: 'scheduled routine for ' + route.agentId + (armError ? ' (arm failed)' : '')

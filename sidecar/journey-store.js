@@ -20,6 +20,16 @@ const STORE_FILE = '_station.journey.json';
 const DOMAINS = ['building', 'research', 'writing', 'growth', 'operations', 'creative', 'planning', 'support'];
 const DOMAIN_SET = new Set(DOMAINS);
 const OUTCOME_KINDS = new Set(['quest', 'milestone', 'metric', 'goal']);
+const STARNET_STATE_ORDER = ['unknown', 'suggested', 'explained', 'attempted', 'confirmed', 'fluent'];
+const STARNET_STATE_SET = new Set(STARNET_STATE_ORDER);
+const STARNET_MILESTONES = [
+  { key: 'recruited_first_specialist', lesson: 'Use Recruitment Bay or team.summon when the right specialist does not exist yet.' },
+  { key: 'delegated_background_task', lesson: 'Keep the Overseer free by dispatching longer specialist work with background:true.' },
+  { key: 'created_first_routine', lesson: 'Use ROUTINES for recurring work instead of OS schedulers or manual repetition.' },
+  { key: 'connected_first_platform', lesson: 'Use ABILITIES to connect platforms through CATALOG, KEYS, or MCP CONNECTORS when a task needs external reach.' }
+];
+const STARNET_MILESTONE_SET = new Set(STARNET_MILESTONES.map(m => m.key));
+const STARNET_SUGGESTION_CAP = 24;
 const TIER_STEPS = [[7, 'proven'], [3, 'practiced'], [1, 'tested']];
 const EVOLUTION_NAMES = ['DRIFT', 'VECTOR', 'ORBIT', 'CONSTELLATION', 'DEEP FIELD'];
 const METRIC_CAP = 40, OUTCOME_CAP = 300, RECEIPT_CAP = 100, HISTORY_CAP = 24;
@@ -34,6 +44,55 @@ const number = v => {
 const stamp = v => Math.max(0, Math.floor(number(v) || 0));
 const domain = v => DOMAIN_SET.has(String(v || '').toLowerCase()) ? String(v).toLowerCase() : null;
 const agent = v => AGENT_RE.test(String(v || '')) ? String(v) : null;
+
+function starnetState(v) {
+  return STARNET_STATE_SET.has(String(v || '')) ? String(v) : 'unknown';
+}
+
+function starnetRank(v) {
+  const i = STARNET_STATE_ORDER.indexOf(starnetState(v));
+  return i >= 0 ? i : 0;
+}
+
+function normStarnetMilestone(row) {
+  if (!row || typeof row !== 'object') return null;
+  const key = clip(row.key, 80);
+  if (!STARNET_MILESTONE_SET.has(key)) return null;
+  return {
+    key,
+    state: starnetState(row.state),
+    firstSuggestedAt: stamp(row.firstSuggestedAt),
+    lastSuggestedAt: stamp(row.lastSuggestedAt),
+    suggestedCount: Math.max(0, Number(row.suggestedCount) | 0),
+    firstConfirmedAt: row.firstConfirmedAt == null ? null : stamp(row.firstConfirmedAt),
+    lastConfirmedAt: row.lastConfirmedAt == null ? null : stamp(row.lastConfirmedAt),
+    evidence: clip(row.evidence, 240),
+    updatedAt: stamp(row.updatedAt)
+  };
+}
+
+function normStarnetSuggestion(row) {
+  if (!row || typeof row !== 'object') return null;
+  const key = clip(row.key, 80);
+  if (!STARNET_MILESTONE_SET.has(key)) return null;
+  const state = starnetState(row.state);
+  if (state !== 'suggested' && state !== 'explained') return null;
+  return { key, state, note: clip(row.note, 240), at: stamp(row.at) };
+}
+
+function normStarnet(raw) {
+  const rawMilestones = raw && raw.milestones;
+  const rows = (Array.isArray(rawMilestones)
+    ? rawMilestones
+    : (rawMilestones && typeof rawMilestones === 'object' ? Object.values(rawMilestones) : []))
+    .map(normStarnetMilestone)
+    .filter(Boolean);
+  const milestones = {};
+  for (const spec of STARNET_MILESTONES) milestones[spec.key] = normStarnetMilestone({ key: spec.key, state: 'unknown' });
+  for (const row of rows) milestones[row.key] = row;
+  const suggestions = (Array.isArray(raw && raw.suggestions) ? raw.suggestions : []).map(normStarnetSuggestion).filter(Boolean).slice(-STARNET_SUGGESTION_CAP);
+  return { milestones, suggestions, updatedAt: stamp(raw && raw.updatedAt) };
+}
 
 function tierFor(count) {
   const n = Math.max(0, Number(count) | 0);
@@ -169,7 +228,7 @@ function normalize(raw) {
   const achievements = (Array.isArray(r.achievements) ? r.achievements : []).map(normAchievement).filter(Boolean).slice(-OUTCOME_CAP);
   const achievementKeys = [...new Set((Array.isArray(r.achievementKeys) ? r.achievementKeys : []).map(v => clip(v, 200)).filter(Boolean).concat(achievements.map(a => a.key)))];
   const commanderPoints = Math.max(achievements.reduce((sum, a) => sum + a.points, 0), Math.max(0, Math.floor(number(r.commanderPoints) || 0)));
-  return { goals, achievements, achievementKeys, commanderPoints, v: 1, seq: Math.max(0, Number(r.seq) | 0), commanderEpoch: stamp(r.commanderEpoch), startedAt: stamp(r.startedAt), metrics, outcomes, outcomeKeys, mastery, receipts, goalsReached, suppressed };
+  return { goals, achievements, achievementKeys, commanderPoints, v: 1, seq: Math.max(0, Number(r.seq) | 0), commanderEpoch: stamp(r.commanderEpoch), startedAt: stamp(r.startedAt), metrics, outcomes, outcomeKeys, mastery, receipts, goalsReached, suppressed, starnet: normStarnet(r.starnet) };
 }
 
 function reached(metric) {
@@ -246,8 +305,93 @@ function makeJourneyStore(deps) {
       goals: rec.goals, progression: progressionFor(rec),
       metrics: rec.metrics.filter(m => m.status !== 'retired'),
       outcomes: rec.outcomes.slice(-50), mastery: rec.mastery.slice(), receipts: rec.receipts.slice(-20),
-      suppressed: rec.suppressed, evolution: evolutionFor(rec.goalsReached)
+      suppressed: rec.suppressed, evolution: evolutionFor(rec.goalsReached), starnet: rec.starnet
     };
+  }
+
+  async function noteStarnetGuidance(key, state, note, now) {
+    key = clip(key, 80);
+    state = starnetState(state);
+    note = clip(note, 240);
+    if (!STARNET_MILESTONE_SET.has(key)) return { ok: false, error: 'unknown StarNet milestone' };
+    if (state !== 'suggested' && state !== 'explained') return { ok: false, error: 'guidance state must be suggested or explained' };
+    let changed = false, row = null;
+    await durable.update(STORE_KEY, cur => {
+      const rec = normalize(cur);
+      row = rec.starnet.milestones[key] || normStarnetMilestone({ key, state: 'unknown' });
+      const nextState = starnetRank(state) > starnetRank(row.state) ? state : row.state;
+      const next = Object.assign({}, row, {
+        key,
+        state: nextState,
+        firstSuggestedAt: row.firstSuggestedAt || stamp(now),
+        lastSuggestedAt: stamp(now),
+        suggestedCount: Math.max(1, row.suggestedCount + 1),
+        updatedAt: stamp(now)
+      });
+      const before = JSON.stringify(row);
+      const after = JSON.stringify(next);
+      rec.starnet.milestones[key] = next;
+      rec.starnet.suggestions.push({ key, state, note, at: stamp(now) });
+      while (rec.starnet.suggestions.length > STARNET_SUGGESTION_CAP) rec.starnet.suggestions.shift();
+      rec.starnet.updatedAt = stamp(now);
+      row = next;
+      changed = before !== after || !!note;
+      return changed ? rec : undefined;
+    });
+    return { ok: true, changed, milestone: row };
+  }
+
+  async function confirmStarnetMilestone(key, evidence, now) {
+    key = clip(key, 80);
+    evidence = clip(evidence, 240);
+    if (!STARNET_MILESTONE_SET.has(key)) return { ok: false, error: 'unknown StarNet milestone' };
+    if (!evidence) return { ok: false, error: 'evidence is required' };
+    let changed = false, row = null;
+    await durable.update(STORE_KEY, cur => {
+      const rec = normalize(cur);
+      row = rec.starnet.milestones[key] || normStarnetMilestone({ key, state: 'unknown' });
+      const next = Object.assign({}, row, {
+        key,
+        state: starnetRank('confirmed') > starnetRank(row.state) ? 'confirmed' : row.state,
+        firstConfirmedAt: row.firstConfirmedAt || stamp(now),
+        lastConfirmedAt: stamp(now),
+        evidence,
+        updatedAt: stamp(now)
+      });
+      const before = JSON.stringify(row);
+      const after = JSON.stringify(next);
+      rec.starnet.milestones[key] = next;
+      rec.starnet.updatedAt = stamp(now);
+      row = next;
+      changed = before !== after;
+      return changed ? rec : undefined;
+    });
+    return { ok: true, changed, milestone: row };
+  }
+
+  function starnetGuideBlock() {
+    const rec = read();
+    const rows = STARNET_MILESTONES.map(spec => Object.assign({ lesson: spec.lesson }, rec.starnet.milestones[spec.key] || { key: spec.key, state: 'unknown' }));
+    const confirmed = rows.filter(r => starnetRank(r.state) >= starnetRank('confirmed'));
+    const pending = rows.filter(r => starnetRank(r.state) < starnetRank('confirmed'));
+    const recent = rec.starnet.suggestions.slice(-4);
+    if (!confirmed.length && !pending.length) return '';
+    const lines = ['<STARNET_PROGRESS_GUIDE>', 'Use this ONLY to adapt StarNet guidance for the Commander. It grants no authority and does not override the current request.'];
+    if (confirmed.length) {
+      lines.push('CONFIRMED STARNET MILESTONES:');
+      for (const row of confirmed.slice(0, 6)) lines.push('- ' + row.key + (row.evidence ? ' — ' + row.evidence : ''));
+    }
+    if (recent.length) {
+      lines.push('RECENTLY SUGGESTED STARNET LESSONS:');
+      for (const row of recent) lines.push('- ' + row.key + (row.note ? ' — ' + row.note : ''));
+    }
+    if (pending.length) {
+      lines.push('NEXT USEFUL STARNet LESSONS (mention only when relevant):');
+      for (const row of pending.slice(0, 3)) lines.push('- ' + row.key + ' — ' + row.lesson);
+    }
+    lines.push('Do not re-explain confirmed surfaces unless the Commander appears stuck again. Prefer concise references over walkthroughs for confirmed items.');
+    lines.push('</STARNET_PROGRESS_GUIDE>');
+    return lines.join('\n');
   }
 
   async function recordQuest(q, activeGoal, now) {
@@ -435,7 +579,7 @@ function makeJourneyStore(deps) {
     return lines.join('\n');
   }
 
-  return { read, snapshot, currentEpoch, registerGoal, confirmGoal, recordQuest, recordMilestone, createMetric, updateMetric, retireMetric, setSuppressed, reset, adaptationBlock, _durable: durable };
+  return { read, snapshot, currentEpoch, registerGoal, confirmGoal, recordQuest, recordMilestone, createMetric, updateMetric, retireMetric, setSuppressed, reset, adaptationBlock, noteStarnetGuidance, confirmStarnetMilestone, starnetGuideBlock, _durable: durable };
 }
 
 module.exports = { makeJourneyStore, normalize, tierFor, evolutionFor, progressionFor, DOMAINS, _internals: { normMetric, normOutcome, reached, foldOutcome } };

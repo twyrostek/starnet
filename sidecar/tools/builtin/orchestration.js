@@ -218,6 +218,9 @@
        both have to ask the live page. Absent (headless run, bare unit caller) -> session targeting is refused
        honestly rather than silently ignored. See sidecar/station-bridge.js. */
     const station = (deps.station && typeof deps.station.request === 'function') ? deps.station : null;
+    const journeyStore = deps && deps.journeyStore && typeof deps.journeyStore.confirmStarnetMilestone === 'function'
+      ? deps.journeyStore
+      : null;
     function workerWire(ident) {
       const wanted = (ident && ident.provider) ? String(ident.provider) : '';
       const ownModel = (ident && ident.model) ? String(ident.model) : '';
@@ -579,6 +582,11 @@
                 structuredResult: r.structuredResult, validation: r.validation, repairRunId: r.repairRunId, artifacts: r.artifacts };
             });
           });
+          if (journeyStore && started.some(r => r && r.id)) {
+            try {
+              await journeyStore.confirmStarnetMilestone('delegated_background_task', 'Started delegated background worker work through team.dispatch.', now());
+            } catch (_) {}
+          }
           const startedRows = started.concat(overflowRows());
           return { content: JSON.stringify(startedRows), summary: 'started ' + started.filter(r => r && r.id).length + ' background worker(s)' + overflowNote };
         }
@@ -844,6 +852,11 @@
         const newId = (ack && typeof ack === 'object') ? ack.agentId : ack;
         const desk = (ack && typeof ack === 'object' && ack.desk) ? String(ack.desk) : '';
         if (!newId) return { content: 'The summon was not completed — the Commander declined it, or the station did not respond. No agent was created.', summary: 'declined' };
+        if (journeyStore) {
+          try {
+            await journeyStore.confirmStarnetMilestone('recruited_first_specialist', 'Summoned specialist ' + String(newId) + ' with team.summon.', now());
+          } catch (_) {}
+        }
         // DESK: a summoned specialist needs a workstation to sit and work at, so the station sorts its desk as
         // part of THIS summon. Reported only when the station named a room — never assumed, so the reply can't
         // promise furniture the floor doesn't have (and can't tell the Commander to go build a second one).

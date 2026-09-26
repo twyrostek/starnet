@@ -99,7 +99,7 @@ const { CAP_REGISTRY } = require('./capability/registry.js');
 const { toolsetRows, toggleableCaps } = require('./capability/toolsets.js');   // TOOLSETS console: capId families derived from CAP_REGISTRY
 const { makeCapCtx } = require('./capability/capGate.js');
 const { composeOffice, stationWithObject, stationWithConnectors } = require('./capability/office.js');   // THE MOAT: interactive office = compute freebie + placed caps
-const { summarizeCapabilities } = require('./capability/capsummary.js');   // truthful "what you can/can't do" so the agent stops over-promising
+const { summarizeCapabilities, taskCapabilityGuidance } = require('./capability/capsummary.js');   // truthful powers + task-relevant StarNet upgrade guidance
 const { starnetManual } = require('./manual.js');   // truthful "how StarNet works" so the agent can guide a stuck Commander (interactive only)
 const FinishLine = require('./finish-line.js');     // immutable "crawl to the finish line" task doctrine at the final prompt seam
 const { makeHarnessSnapshot } = require('./harness-snapshot.js');   // bounded secret-free build/scheduler/connectors/diagnostics truth for station.inspect
@@ -11332,6 +11332,9 @@ async function handleConnectorUpsert(req, res) {
     return json(500, { ok: false, saved: false, connected: false, error: 'connector configuration could not be saved' });
   }
   adoptConnectorState(nextState);
+  try {
+    await journeyStore.confirmStarnetMilestone('connected_first_platform', 'Saved connector ' + id + ' using ' + transport + ' transport.', Date.now());
+  } catch (_) {}
   let result; try { result = await configureConnectorCfg(cfg); } catch (e) { result = { ok: false, state: 'error', error: (e && e.message) || 'configure failed' }; }
   const status = connectors.status(id);
   if (result.ok) return json(200, Object.assign({ saved: true, connected: status.state === 'up', status: status,
@@ -15800,7 +15803,7 @@ async function runOnceCore(o) {
   // in the room — conferred ONLY on the lead run (below), so a delegated worker can never re-delegate. It calls
   // THIS SAME runOnce per worker; the roster supplies each worker's composed identity (system prompt + model).
   makeOrchestrationTools({
-    runOnce, roster: () => agentRoster, key: runKey, model, provider: providerId, baseUrl, reasoningEffort, subagents,
+    runOnce, roster: () => agentRoster, key: runKey, model, provider: providerId, baseUrl, reasoningEffort, subagents, journeyStore,
     coordinateResults: require('./overseer.js').isCoordinatorRun({ ...o, agentId, surface }),
     classes: SPECIALIST_CLASSES,   // Class Loadouts S1: the summon-tool class list, composed from the shared catalog (no hardcoded prose)
     selfSystem: system,   // team.spawn clones the LEAD's OWN base identity into each ephemeral subagent (Meeseeks)
@@ -15855,6 +15858,7 @@ async function runOnceCore(o) {
     ? overseerStation(o.streamId, runId) : stationBridge }).register(registry);
   // routine.create/list: the lead can schedule real StarNet ROUTINES through the same cron store the panel uses.
   makeRoutineTools({
+    journeyStore,
     roster: () => agentRoster,
     listJobs: () => cronJobs,
     schedulerState: () => cronArmed,
@@ -17328,6 +17332,19 @@ async function runOnceCore(o) {
   // Commander suppresses that domain. It grants no tools or authority; it is a bounded planning prior.
   let journeyBlock = '';
   if (!internal) { try { const jb = journeyStore.adaptationBlock(agentId); if (jb) journeyBlock = '\n\n' + jb; } catch (_) { journeyBlock = ''; } }
+  let starnetGuideBlock = '';
+  const isOverseerGuideRun = !internal && isTask && surface === 'interactive'
+    && require('./overseer.js').isCoordinatorRun({ ...o, agentId, surface });
+  if (isOverseerGuideRun) {
+    try { const gb = journeyStore.starnetGuideBlock(); if (gb) starnetGuideBlock = '\n\n' + gb; } catch (_) { starnetGuideBlock = ''; }
+  }
+  let taskCapabilityBlock = '';
+  if (isOverseerGuideRun) {
+    try {
+      const guidance = taskCapabilityGuidance(resolved, latestUserText(messages), { surface, unrestrictedHost: unrestrictedHostNow() });
+      if (guidance) taskCapabilityBlock = '\n\n' + guidance;
+    } catch (_) { taskCapabilityBlock = ''; }
+  }
   /* DELIVERABLE NAMING — asked for at THE one final prompt seam, so every real-work surface gets it identically:
      the watched browser run, a cron routine, a Workshop shift, a messaging reply. Putting it on handleRun alone
      (as a first draft did) left the AWAY runs — the ones nobody watched and therefore most need a readable name —
@@ -17344,7 +17361,7 @@ async function runOnceCore(o) {
   const cacheSystemPrefix = (system || '') + toolNote + teamNote + manualBlock
     + summarizeCapabilities(resolved, { surface, ownerTrusted, unrestrictedHost: unrestrictedHostNow() }) + skillBlock;
   const taskSystem = FinishLine.append(cacheSystemPrefix + runtimeSkillBlock
-    + preloadedSkillBlock + serviceKeysBlock + taskIntentNote + directDomainBlock + journeyBlock
+    + preloadedSkillBlock + serviceKeysBlock + taskIntentNote + directDomainBlock + journeyBlock + starnetGuideBlock + taskCapabilityBlock
     + deliverableNote + runtimeBlock, { isTask, internal, tools: resolved.tools });
   const sys = internal
     ? (String(system || '') + evidenceBlock)

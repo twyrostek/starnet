@@ -40,6 +40,51 @@ const CAPS = [
 // The powers a Commander most often assumes an agent has -> highest over-promise risk -> nag if absent.
 const CORE = ['web', 'cabinet', 'workbench'];
 
+const TASK_CAPABILITY_SIGNALS = [
+  { id: 'web', score: 5, match: /\b(research|search|browse|web|internet|latest|current|news|sources?|competitors?|market|fact.?check|compare options)\b/i,
+    use: 'Search or fetch current information and compare sources.' },
+  { id: 'workbench', score: 6, match: /\b(implement|code|coding|program|debug|refactor|compile|run tests?|test the (?:app|code|project)|build (?:the|a) (?:app|project|package)|terminal|command line|dependency|server)\b/i,
+    use: 'Run code, tests, or project commands in the station workspace.' },
+  { id: 'cabinet', score: 4, match: /\b(read|edit|update|write|create|search|find|organize)\b.{0,45}\b(files?|folders?|workspace|repository|repo|codebase|documents?|spreadsheets?)\b|\b(files?|folders?|workspace|repository|repo|codebase|documents?|spreadsheets?)\b.{0,45}\b(read|edit|update|write|create|search|find|organize)\b/i,
+    use: 'Read or change local project files.' },
+  { id: 'studio', score: 5, match: /\b(generate|create|edit|analyze|make)\b.{0,35}\b(images?|illustrations?|visuals?|artwork|graphics?)\b|\b(images?|illustrations?|visuals?|artwork|graphics?)\b.{0,35}\b(generate|create|edit|analyze)\b/i,
+    use: 'Generate or analyze visual assets.' },
+  { id: 'jukebox', score: 5, match: /\b(spotify|music|playlist|play a song|play music|queue songs?)\b/i,
+    use: 'Search or control Spotify playback.' },
+  { id: 'memory', score: 4, match: /\b(remember|save this preference|recall|long.?term memory|keep this for later)\b/i,
+    use: 'Save or recall durable notes and reusable skills.' }
+];
+
+function taskCapabilityGuidance(resolved, taskText, opts) {
+  opts = opts || {};
+  const text = String(taskText || '').trim();
+  if (!text || opts.surface && opts.surface !== 'interactive') return '';
+  const grants = new Set(((resolved && resolved.grants) || []).map(g => g && g.capId).filter(Boolean));
+  const tools = Array.isArray(resolved && resolved.tools) ? resolved.tools : [];
+  const byTool = tools.length > 0;
+  const available = cap => {
+    const row = CAPS.find(c => c.id === cap);
+    if (!row) return false;
+    if (grants.has(cap) && (!byTool || tools.indexOf(row.probe) >= 0)) return true;
+    return opts.unrestrictedHost === true && (cap === 'cabinet' || cap === 'workbench');
+  };
+  const ranked = TASK_CAPABILITY_SIGNALS.filter(row => row.match.test(text))
+    .sort((a, b) => b.score - a.score || CAPS.findIndex(c => c.id === a.id) - CAPS.findIndex(c => c.id === b.id))
+    .slice(0, 2);
+  if (!ranked.length) return '';
+  const lines = ['[TASK-RELEVANT STARNET CAPABILITIES]'];
+  for (const row of ranked) {
+    const cap = CAPS.find(c => c.id === row.id);
+    if (!cap) continue;
+    if (available(row.id)) {
+      lines.push('- ' + cap.have + ' is already available and may help: ' + row.use + ' Do not recommend adding another prop.');
+    } else {
+      lines.push('- This task may benefit from ' + cap.have + ' (' + row.use + '). The current interactive run lacks it; if it would materially help, briefly recommend placing ' + cap.object + '. Continue with what is available and do not imply the prop has been placed.');
+    }
+  }
+  return lines.length > 1 ? lines.join('\n') : '';
+}
+
 function summarizeCapabilities(resolved, opts) {
   opts = opts || {};
   const interactive = !opts.surface || opts.surface === 'interactive';
@@ -108,4 +153,4 @@ function summarizeCapabilities(resolved, opts) {
   return note;
 }
 
-module.exports = { summarizeCapabilities };
+module.exports = { summarizeCapabilities, taskCapabilityGuidance };
