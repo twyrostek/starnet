@@ -9422,6 +9422,7 @@ const ROUTES = [
   { m: 'GET', exact: '/api/auth/kimi/models', h: (req, res) => handleOAuthModels(req, res, 'kimi') },
   { m: 'POST', exact: '/api/auth/kimi/logout', h: (req, res) => handleOAuthLogout(req, res, 'kimi') },
   { m: 'GET', exact: '/api/providers', h: handleProviders },
+  { m: 'POST', exact: '/api/providers/runtime-key', h: handleProviderRuntimeKey },
   { m: 'POST', exact: '/api/providers/probe', h: handleProviderProbe },
   { m: 'POST', exact: '/api/providers/validate', h: handleProviderValidate },
   // /api/models/openrouter is served by this same prefix (id='openrouter'). handleProviderModels answers 200
@@ -19730,7 +19731,11 @@ function handleProviders(req, res) {
   const providers = listProviderProfiles().map(p => {
     const key = providerRuntimeKey(p.id, '');
     const baseUrl = providerRuntimeBaseUrl(p.id, '');
-    return Object.assign({}, p, { configured: providerHasCredential(p.id, key, baseUrl), currentBaseUrl: baseUrl || '' });
+    return Object.assign({}, p, {
+      configured: providerHasCredential(p.id, key, baseUrl),
+      alternateCount: providerRuntimeKeyPool(p.id).length,
+      currentBaseUrl: baseUrl || ''
+    });
   });
   res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   // keychainMode: TRUE only under the real desktop shell, where BYOK keys live in the OS keychain (seeded via env
@@ -19738,6 +19743,27 @@ function handleProviders(req, res) {
   // confirmation reads this so it names the ACTUAL store honestly (keychain vs this browser) — never claims
   // keychain when the key is in fact held in the browser (truthful-telemetry law).
   res.end(JSON.stringify({ providers, keychainMode: DESKTOP_SHELL }));
+}
+
+// Source/browser BYOK handoff. This route is protected by the ordinary per-launch API token and
+// deliberately stores credentials only in the running sidecar's memory. Packaged desktop builds
+// must use the Tauri/keychain IPC route instead.
+async function handleProviderRuntimeKey(req, res) {
+  const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
+  if (DESKTOP_SHELL) return json(404, { ok: false, error: 'desktop credentials must use the OS keychain' });
+  let body; try { body = JSON.parse(await readBody(req, 1 << 16)) || {}; } catch (_) { return json(400, { ok: false, error: 'bad json' }); }
+  const id = normalizeProvider(body.provider);
+  const profile = getProviderProfile(id);
+  if (!profile || providerUsesCodex(id) || providerUsesDeviceOAuth(id)) return json(400, { ok: false, error: 'this provider does not accept an API key' });
+  const patch = {};
+  if (Object.prototype.hasOwnProperty.call(body, 'key')) patch.key = body.key;
+  if (Object.prototype.hasOwnProperty.call(body, 'keyPool')) patch.keyPool = body.keyPool;
+  if (Object.prototype.hasOwnProperty.call(body, 'baseUrl')) patch.baseUrl = body.baseUrl;
+  const configured = setProviderRuntimeConfig(id, patch);
+  if (!configured) return json(400, { ok: false, error: 'unknown provider' });
+  const key = providerRuntimeKey(id, '');
+  const baseUrl = providerRuntimeBaseUrl(id, '');
+  return json(200, { ok: true, provider: id, configured: providerHasCredential(id, key, baseUrl), alternateCount: providerRuntimeKeyPool(id).length });
 }
 
 // POST /api/providers/probe — a no-generation provider round-trip for truthful Settings telemetry. The supplied
