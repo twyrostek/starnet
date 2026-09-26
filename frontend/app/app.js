@@ -780,7 +780,7 @@ const App = (() => {
   }
   function providerKeyPlaceholder(provider, configured) {
     const p = normalizeProviderId(provider);
-    if (configured) return 'stored locally - leave blank to keep';
+    if (configured) return (Harness.isDesktop && Harness.isDesktop()) ? 'stored in keychain - leave blank to keep' : 'configured for this sidecar session - leave blank to keep';
     if (p === 'openai') return 'sk-...  -  platform.openai.com/api-keys';
     if (p === 'anthropic') return 'sk-ant-...  -  console.anthropic.com/settings/keys';
     if (p === 'gemini') return 'AIza...  -  aistudio.google.com/app/apikey';
@@ -2482,15 +2482,16 @@ const App = (() => {
   function initConnect(prefillName, isRecovery, savedAgent) {
     const recovery = !!isRecovery && !!savedAgent;
     el('in-key').value = Harness.getKey();
-    // remember what the field was pre-seeded with (browser BYOK: a real stored key; desktop keychain: '') so
-    // onWake can ask ONCE before an edited value silently replaces a stored key. Reset the confirm latch for
-    // this fresh screen. (An empty prefill means there's nothing to overwrite — the guard stays dormant.)
+    // Source and desktop credentials are intentionally never prefilled. Reset the overwrite-confirm latch
+    // for this fresh screen; the configured badge is the only credential-state signal this page receives.
     prefilledKey = el('in-key').value || '';
     keyOverwriteConfirmed = false;
     unhingedConfirmed = false;   // each fresh create screen re-arms the UNHINGED two-press confirm
-    // desktop: the key lives in the OS keychain (getKey returns ''); show that it's already set.
+    // Credentials never enter this page after save: desktop uses the keychain and source mode uses the running sidecar.
     if (Harness.configured && Harness.configured() && !el('in-key').value) {
-      el('in-key').placeholder = '•••••••• stored in keychain — leave blank to keep';
+      el('in-key').placeholder = (Harness.isDesktop && Harness.isDesktop())
+        ? '•••••••• stored in keychain — leave blank to keep'
+        : '•••••••• configured for this sidecar session — leave blank to keep';
     }
     // RESUME pre-fills the saved agent's model; a fresh screen carries the last-used model.
     el('in-model').value = recovery ? (savedAgent.model || Harness.getModel()) : Harness.getModel();
