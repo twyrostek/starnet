@@ -43,9 +43,12 @@ A.ok(!/never say you cannot reach the web or files/.test(sidecar), 'old blanket 
 A.ok(src.includes("fetchModelCatalog('/api/models/' + encodeURIComponent(p) + q, 'models')"), 'Harness.listModels prefers the sidecar provider catalog');
 A.ok(src.includes("fetchModelCatalog(OR + '/models', 'data')"), 'Harness.listModels keeps the direct OpenRouter catalog as fallback');
 A.ok(src.includes("params.indexOf('tools') >= 0"), 'Harness.listModels derives tool support from supported_parameters when needed');
-A.ok(src.includes("providerSlot(base, provider)"), 'Harness stores key/base-url settings in provider-scoped localStorage slots');
+A.ok(src.includes("providerSlot(base, provider)"), 'Harness stores nonsecret base-url settings in provider-scoped localStorage slots');
 A.ok(src.includes("invoke('harness_store_provider_key'"), 'desktop Harness pushes provider-scoped key updates to Tauri');
 A.ok(src.includes('getKey(provider)') || /const\s+getKey\s*=\s*provider\s*=>/.test(src), 'Harness.getKey accepts a provider argument');
+A.ok(src.includes("fetch('/api/providers/runtime-key'"), 'source Harness hands provider credentials to the authenticated sidecar runtime');
+A.ok(src.includes('clearLegacyBrowserCredentials()'), 'source Harness removes legacy browser-persisted provider credentials');
+A.ok(!/reqBody\.key\s*=/.test(src) && !/reqBody\.keyPool\s*=/.test(src), 'run payloads never carry provider credentials from the browser');
 /* ---------- BOOTFIX regression guard: the seeded DEV / resume floor must NEVER wait on the model catalog ----------
    listModels() proxies a LIVE external OpenRouter /models fetch; awaiting it inline on the auto-resume path
    strands boot on #screen-connect forever when that upstream is slow/blocked (the seeded SKYNET_DEV shoot

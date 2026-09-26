@@ -4284,10 +4284,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function oauthConnectedFor(pid) { return pid === 'codex' ? codexConnected() : oauthProvConnected(pid); }
   function oauthExpiredFor(pid) { return pid === 'codex' ? codexExpired() : oauthProvExpired(pid); }
   function oauthReasonFor(pid) { return pid === 'codex' ? codexExpiredReason() : oauthProvReason(pid); }
-  // Where do saved API keys actually live? TRUTH SOURCE = the sidecar's keychainMode (DESKTOP_SHELL): the packaged
-  // desktop build holds BYOK keys in the OS keychain; the browser holds them in its own local store. We learn this
-  // lazily from /api/providers (mirrors the codex-status probe) and cache it so the key-save confirmation can name
-  // the REAL store — never claim keychain when the key is in the browser (truthful-telemetry law).
+  // Where do API keys actually live? TRUTH SOURCE = the sidecar's keychainMode (DESKTOP_SHELL): the packaged
+  // desktop build holds BYOK keys in the OS keychain; source mode holds them only in the running sidecar. We learn
+  // this lazily from /api/providers and cache it so the key-save confirmation names the real store.
   let keychainModeKnown = null;
   let keychainModeChecking = false;
   function refreshKeychainMode() {
@@ -4303,7 +4302,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // probe answers, so we never assert keychain-vs-browser before we actually know it.
   function keyStoreClause() {
     if (keychainModeKnown === true) return 'stored in your OS keychain';
-    if (keychainModeKnown === false) return 'stored locally in this browser';
+    if (keychainModeKnown === false) return 'held by the running local sidecar';
     return 'stored on this machine';
   }
   const providerHealth = Object.create(null);   // last no-generation sidecar probe, keyed by provider id
@@ -4827,7 +4826,11 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           const keylessCustomRm = row.provider === 'custom' && !row.key && !!row.baseUrl;
           if (b.dataset.armed) {
             if (keylessCustomRm && h.setBaseUrl) { h.setBaseUrl('', 'custom'); notify('removed the custom endpoint — add it again anytime from the CUSTOM card', 'warn'); }
-            else { if (h.setKey) h.setKey('', row.provider); notify('removed ' + provName(row.provider) + ' key — paste a new one here to reconnect', 'warn'); }
+            else {
+              Promise.resolve(h.setKey && h.setKey('', row.provider))
+                .then(() => notify('removed ' + provName(row.provider) + ' key — paste a new one here to reconnect', 'warn'))
+                .catch(e => notify('could not remove ' + provName(row.provider) + ' key: ' + ((e && e.message) || e), 'warn'));
+            }
             invalidateProviderHealth(row.provider); if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect(); if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh(); sfx('bad'); rerender('settings'); return;
           }
           // Arm: make the destructive state impossible to miss — filled --bad button + pulse, red hairline on the row,
@@ -5875,7 +5878,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div class="prov-list">' + providersHtml() + '</div>' +
       '<h4 class="ms-h">API KEYS</h4>' +
       '<div class="key-list">' + keysHtml() + '</div>' +
-      '<p class="set-about">Credentials are saved locally and used to authenticate with the selected service. Saved keys stay masked. Desktop storage uses the OS keychain when available.</p>' +
+      '<p class="set-about">Credentials authenticate with the selected service. Desktop storage uses the OS keychain; source runs retain pasted keys only in the running local sidecar.</p>' +
       // STORE / MANAGED CREDITS — rendered ONLY when the sidecar reports a configured credits backend (/api/credits).
       // When credits aren't wired this stays an empty node (no dead card, no fake balance — the honesty law). wireCredits
       // fetches the real balance + history and the external purchase link; buying opens a browser tab, never an in-app form.

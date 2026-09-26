@@ -1,10 +1,9 @@
 /* STARNET — harness.js : the REAL agent harness (BYOK).
-   Owns the model connection + streaming + token/cost accounting.
+  Owns the model connection + streaming + token/cost accounting.
 
-   For this prototype the call goes browser -> OpenRouter directly (CORS-friendly,
-   key in localStorage). In the shipped desktop build this exact interface is
-   re-implemented behind the Tauri sidecar + OS keychain — callers (chat.js) never
-   change, only the transport inside Harness.chat() does. Keep that seam clean. */
+  Provider credentials never persist in the browser. The desktop shell writes them
+  to the OS keychain; a source/browser run hands a pasted key once to the authenticated
+  local sidecar, which keeps it only for its current process lifetime. */
 'use strict';
 
 const Harness = (() => {
@@ -144,8 +143,8 @@ const Harness = (() => {
   }
 
   // Desktop (Tauri) build: the BYOK key lives in the OS keychain — never in localStorage and
-  // never returned to this WebView. Rust stores it and injects it into the sidecar's env at spawn
-  // (read only there). The browser build keeps the localStorage transport unchanged.
+  // never returned to this WebView. Rust stores it and injects it into the sidecar's env at spawn.
+  // Source/browser runs use the same no-readback shape: the sidecar holds a session-only runtime key.
   const TAURI = (typeof window !== 'undefined') && window.__TAURI__ && window.__TAURI__.core;
   const DESKTOP = !!TAURI;
   const invoke = (cmd, args) => TAURI.invoke(cmd, args);
@@ -231,7 +230,11 @@ const Harness = (() => {
     // they are configured identically in a browser build and a packaged one. Probing after the return would
     // leave configured('starnet') false forever anywhere that isn't Tauri — including every dev session.
     await refreshCreditsConfigured();
-    if (!DESKTOP) return;
+    if (!DESKTOP) {
+      clearLegacyBrowserCredentials();
+      await refreshProviderCredentials();
+      return;
+    }
     let loaded = false;
     try {
       const status = await invoke('harness_provider_key_status');
@@ -329,6 +332,42 @@ const Harness = (() => {
     localStorage.setItem(providerSlot(base, p), v);
     if (p === 'openrouter') localStorage.setItem(base, v);
   }
+  function clearLegacyBrowserCredentials() {
+    try {
+      const stale = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i) || '';
+        if (key === LS.key || key === LS.keyPool || key.indexOf(LS.key + '.') === 0 || key.indexOf(LS.keyPool + '.') === 0) stale.push(key);
+      }
+      stale.forEach(key => localStorage.removeItem(key));
+    } catch (_) {}
+  }
+  async function refreshProviderCredentials() {
+    try {
+      const r = await fetch('/api/providers', { cache: 'no-store' });
+      const body = r && r.ok ? await r.json() : null;
+      if (!body || !Array.isArray(body.providers)) return;
+      _configuredByProvider = Object.create(null);
+      _alternateCountByProvider = Object.create(null);
+      body.providers.forEach(provider => {
+        const p = normalizeProviderId(provider && provider.id);
+        _configuredByProvider[p] = !!(provider && provider.configured);
+        _alternateCountByProvider[p] = Math.max(0, Number(provider && provider.alternateCount) || 0);
+      });
+      _configured = !!_configuredByProvider.openrouter;
+    } catch (_) {}
+  }
+  async function storeRuntimeCredential(provider, patch) {
+    const r = await fetch('/api/providers/runtime-key', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ provider: provider }, patch || {}))
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body.ok) throw new Error(String(body.error || 'could not store the session credential'));
+    setDesktopConfigured(provider, !!body.configured);
+    _alternateCountByProvider[provider] = Math.max(0, Number(body.alternateCount) || 0);
+    return body;
+  }
   function setDesktopConfigured(provider, value) {
     const p = normalizeProviderId(provider || getProv());
     _configuredByProvider[p] = !!value;
@@ -348,15 +387,14 @@ const Harness = (() => {
     // through to the keyless branch below, which would answer "configured" for every station simply because
     // there is no key to look for, and claim a station can run on credits it has never been linked to.
     if (p === 'starnet') return !!_configuredByProvider.starnet;
-    return DESKTOP ? !!(_configuredByProvider[p] || (p === 'openrouter' && _configured)) : (DEVMODE || !providerNeedsKey(p) || !!getKey(p));
+    return !!(_configuredByProvider[p] || (p === 'openrouter' && _configured) || DEVMODE || !providerNeedsKey(p));
   }
 
   // Truthful-telemetry getter for the SETTINGS credential list/badges: true IFF a real credential
   // actually exists for this provider — never fabricated by DEVMODE. Unlike configured() (which gates
   // run-ability and intentionally reports true in DEVMODE for auto-resume), this answers ONLY "does a
   // stored credential back this row?" so removing a key makes the row/badge disappear on rerender.
-  //   - a real API key is stored (browser localStorage), OR
-  //   - desktop OS keychain reports it (getKey returns '' by design there; _configuredByProvider holds truth), OR
+  //   - desktop OS keychain or source sidecar reports it (getKey returns '' by design; _configuredByProvider holds truth), OR
   //   - a deliberately keyless endpoint is configured (custom with a baseUrl; ollama is a local endpoint), OR
   //   - codex OAuth is connected, OR
   //   - DEV seed: the host holds a server-side runtime credential for exactly DEV.prov (the seeded provider).
@@ -368,8 +406,7 @@ const Harness = (() => {
     if (p === 'grok' || p === 'kimi') return DESKTOP ? !!_configuredByProvider[p] : (getProv() === p);
     if (p === 'ollama') return false;                      // an endpoint is configuration, never a credential
     if (p === 'custom' && !getKey(p)) return false;        // a keyless custom endpoint must not manufacture a key row
-    if (DESKTOP) return !!(_configuredByProvider[p] || (p === 'openrouter' && _configured));
-    if (!!readScoped(LS.key, p)) return true;              // a real key is stored in this browser
+    if (DESKTOP || _configuredByProvider[p]) return !!(_configuredByProvider[p] || (p === 'openrouter' && _configured));
     // DEV seed: the host may hold a server-side runtime key for the seeded provider. It is not a given —
     // a seeded station with no key at all still boots in DEV mode, and ASSUMING the key existed made the
     // settings row render "● KEY SAVED" over nothing (an agent live-verifying a change reads that badge as
@@ -378,8 +415,12 @@ const Harness = (() => {
     return false;
   }
 
-  // getKey() returns the real key in the browser; in desktop it returns '' (the key isn't here).
-  const getKey = provider => DESKTOP ? '' : readScoped(LS.key, provider);
+  // Provider keys never return to the WebView after entry. Desktop uses the OS keychain; source mode
+  // keeps them only in the authenticated sidecar process.
+  const getKey = provider => {
+    void provider;
+    return '';
+  };
   const setKey = (k, provider) => {
     selectionRevision++;
     const p = normalizeProviderId(provider || getProv());
@@ -398,12 +439,11 @@ const Harness = (() => {
         .then(r => { setDesktopConfigured(p, on); return r; })
         .catch(e => { setDesktopConfigured(p, false); throw e; });
     }
-    writeScoped(LS.key, p, k || '');
+    return storeRuntimeCredential(p, { key: k || '', baseUrl: getBaseUrl(p) || '' });
   };
   function keyPoolSize(provider) {
     const p = normalizeProviderId(provider || getProv());
-    if (DESKTOP) return Math.max(0, Number(_alternateCountByProvider[p]) || 0);
-    try { return JSON.parse(readScoped(LS.keyPool, p) || '[]').length || 0; } catch (_) { return 0; }
+    return Math.max(0, Number(_alternateCountByProvider[p]) || 0);
   }
   function setKeyPool(keys, provider) {
     const p = normalizeProviderId(provider || getProv());
@@ -412,8 +452,7 @@ const Harness = (() => {
       return invoke('harness_store_provider_key_pool', { provider: p, keys: cleaned })
         .then(count => { _alternateCountByProvider[p] = Math.max(0, Number(count) || 0); return count; });
     }
-    writeScoped(LS.keyPool, p, JSON.stringify(cleaned));
-    return Promise.resolve(cleaned.length);
+    return storeRuntimeCredential(p, { keyPool: cleaned }).then(() => cleaned.length);
   }
   async function validateAndSetKeyPool(keys, provider) {
     const p = normalizeProviderId(provider || getProv());
@@ -623,8 +662,8 @@ const Harness = (() => {
 
   // Truthful provider state for Settings. Configuration, credential custody, endpoint reachability and catalog
   // availability are independent facts; callers must never infer one from another. The sidecar performs the
-  // round-trip so desktop keychain credentials stay out of the WebView, while browser BYOK can be supplied over
-  // the same authenticated loopback seam used by /api/run. A failed probe is data, not an exception-shaped lie.
+  // round-trip so desktop keychain and source-sidecar credentials stay out of the WebView. A failed probe is
+  // data, not an exception-shaped lie.
   async function probeProvider(provider) {
     const p = normalizeProviderId(provider || getProv());
     const baseUrl = getBaseUrl(p) || '';
@@ -636,7 +675,7 @@ const Harness = (() => {
     try {
       const r = await fetch('/api/providers/probe', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: p, key: getKey(p) || '', baseUrl })
+        body: JSON.stringify({ provider: p, baseUrl })
       });
       const j = await r.json().catch(() => ({}));
       return {
@@ -690,10 +729,10 @@ const Harness = (() => {
      Each event is re-emitted on U.bus (for telemetry) and mapped to the caller's callbacks.
      onToken(delta) per text delta · onToolCall/onToolResult per tool step · onUsage per turn. */
   async function chat({ system, messages, onToken, onTerminalReset, onUsage, onToolCall, onToolResult, onRunId, onDeliverable, onPermission, onSummon, agentId, isTask, recurring, signal, streamId, recipeId, workbench, placed, stationPlaced, internal, evidence, projectRoot, taskAction, postconditions, recovery, connectorContinuationOf, retryUserRunId }) {
-    const model = getModel(), provider = getProv(), key = getKey(provider), reasoningEffort = getReasoningEffort(provider);
-    // Codex authenticates by an OAuth token (server-side); the desktop build keeps the key in the
-    // sidecar's env (keychain). Neither needs a key sent from here.
-    if (providerNeedsKey(provider) && !DESKTOP && !DEVMODE && !key) throw new Error('no API key set');
+    const model = getModel(), provider = getProv(), reasoningEffort = getReasoningEffort(provider);
+    // Codex authenticates by an OAuth token; desktop keys live in the keychain and source-mode keys
+    // live only in the sidecar. No key is retained or sent by this WebView after entry.
+    if (providerNeedsKey(provider) && !DEVMODE && !_configuredByProvider[provider]) throw new Error('no API key set');
     if (!model) throw new Error('no model selected');
 
     let res;
@@ -736,10 +775,6 @@ const Harness = (() => {
       // available when the STATION has the required shared gear (a specialist owns only a desk yet still gets its
       // class skills). Sent separately so the tool projection is untouched; the sidecar uses it for skills only.
       if (Array.isArray(stationPlaced) && stationPlaced.length) reqBody.stationPlaced = stationPlaced;
-      if (!DESKTOP && !DEVMODE && provider !== 'codex' && provider !== 'grok' && provider !== 'kimi') reqBody.key = key;   // dev/desktop + the OAuth providers keep secrets server-side (custom/ollama may still ride an optional key)
-      if (!DESKTOP && !DEVMODE) {
-        try { const pool = JSON.parse(readScoped(LS.keyPool, provider) || '[]'); if (Array.isArray(pool) && pool.length) reqBody.keyPool = pool; } catch (_) {}
-      }
       res = await fetch('/api/run', {
         method: 'POST', signal,
         headers: { 'Content-Type': 'application/json' },
