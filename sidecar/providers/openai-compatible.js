@@ -24,7 +24,8 @@
   const WIRE_EFFORTS = ['minimal', 'low', 'medium', 'high'];
   function wireEffort(value) {
     const v = String(value || '').trim().toLowerCase();
-    if (!v || v === 'none' || v === 'off') return '';
+    if (!v) return '';
+    if (v === 'none' || v === 'off') return 'none';
     if (v === 'xhigh' || v === 'max' || v === 'extrahigh') return 'high';
     if (v === 'min') return 'minimal';
     return WIRE_EFFORTS.indexOf(v) >= 0 ? v : 'medium';
@@ -227,7 +228,8 @@
            for saved drop-state from older builds). */
       }
       // reasoning_effort goes on the wire only when the model provably reasons (catalog) or the provider
-      // profile documents the param; effort 'none' means omit it entirely.
+      // profile documents the param. Preserve explicit 'none': some tool-capable reasoning models require
+      // that value to disable reasoning on chat/completions rather than treating omission as disabled.
       const effort = wireEffort(req.reasoningEffort || defaultEffort);
       if (effort && !skip('reasoning_effort')) {
         const m = findModel(req.model);

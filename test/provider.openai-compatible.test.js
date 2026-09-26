@@ -233,7 +233,7 @@ module.exports = (async () => {
   }
 
   // reasoning_effort wiring: profile hint sends it (clamped to the wire scale), no hint omits it,
-  // and effort 'none' always omits it
+  // and explicit effort 'none' is sent so compatible reasoning models can disable reasoning with tools.
   {
     const mkFetch = (calls) => async (url, init) => {
       calls.push({ url, init });
@@ -257,7 +257,12 @@ module.exports = (async () => {
     const offCalls = [];
     const pOff = makeOpenAICompatibleProvider({ fetch: mkFetch(offCalls), baseUrl: 'http://local/v1', reasoningEffort: 'none', sendReasoningEffort: true });
     await collect(pOff, { model: 'm', messages: [] });
-    A.eq(JSON.parse(offCalls[0].init.body).reasoning_effort, undefined, 'effort none omits the param entirely');
+    A.eq(JSON.parse(offCalls[0].init.body).reasoning_effort, 'none', 'effort none is sent explicitly to disable reasoning');
+
+    const requestOffCalls = [];
+    const pRequestOff = makeOpenAICompatibleProvider({ fetch: mkFetch(requestOffCalls), baseUrl: 'http://local/v1', reasoningEffort: 'medium', sendReasoningEffort: true });
+    await collect(pRequestOff, { model: 'm', messages: [], reasoningEffort: 'none' });
+    A.eq(JSON.parse(requestOffCalls[0].init.body).reasoning_effort, 'none', 'per-request Off overrides the provider default on the wire');
   }
 
   // catalog-proven reasoning model sends the effort even without a profile hint
