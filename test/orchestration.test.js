@@ -228,6 +228,8 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
     const out = await dispatchTool.run({ workers: [{ agentId: 'researcher', prompt: 'x' }], background: true }, { agentId: 'lead', emit: () => {} });
     const handle = JSON.parse(out.content)[0];
     A.ok(handle.id && handle.status === 'running', 'background dispatch returns a running durable handle immediately');
+    A.ok(out.control && out.control.final, 'background dispatch ends the lead turn after handoff');
+    A.ok(/will not duplicate their work/.test(out.control.text), 'terminal handoff forbids the lead from repeating worker work');
     await tick();
     A.eq(ro.calls[0].maxIters, 0, 'background workers also have no default iteration ceiling');
     await tick(); await tick();
@@ -355,29 +357,55 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
   A.eq(summonTool.capability, 'orchestrator', 'gated by the orchestrator object (lead-only, like team.dispatch)');
   A.eq(summonTool.scope, 'write', 'summon is a write-scope mutation');
   A.eq(summonTool.requiresConsent, true, 'summon IS consent-gated (the APPROVAL beat) — like dispatch/spawn since 2026-07-14');
+  A.ok(summonTool.schema.required.includes('task'), 'summon requires the work to hand off');
   A.ok(typeof summonTool.timeoutMs === 'number' && summonTool.timeoutMs > 120000, 'tool wall-clock outlasts the 120s summon ack backstop (clean null, not a tool timeout)');
 }
 
-// ---- happy path: ctx.summon resolves a new id; the spec is forwarded; the result carries the id for dispatch ----
+// ---- happy path: summon creates a worker and immediately assigns its task in the background ----
 {
   const { summonTool } = makeOrchestrationTools({ runOnce: fakeRunOnce(), roster: () => new Map(), key: 'k', model: 'm', newId: counter() });
-  let gotSpec = null;
-  const ctx = { agentId: 'agent', summon: async (s) => { gotSpec = s; return 'researcher-2'; } };
-  const out = await summonTool.run({ name: 'Researcher', specId: 'researcher', purpose: 'find things' }, ctx);
+  let gotSpec = null, handoff = null;
+  const ctx = {
+    agentId: 'agent', summon: async (s) => { gotSpec = s; return 'researcher-2'; },
+    dispatchSummonedWorker: async (request) => { handoff = request; return { ok: true, content: '[{"id":"sub-1","agentId":"researcher-2","status":"running"}]' }; }
+  };
+  const out = await summonTool.run({ name: 'Researcher', specId: 'researcher', purpose: 'find things', task: 'Research potential business names' }, ctx);
   A.ok(gotSpec && gotSpec.name === 'Researcher' && gotSpec.specId === 'researcher', 'the spec (name + specId) is forwarded to ctx.summon');
   A.eq(gotSpec.purpose, 'find things', 'a custom purpose is forwarded');
+  A.eq(handoff.agentId, 'researcher-2', 'the new specialist is the dispatch target');
+  A.eq(handoff.task, 'Research potential business names', 'the Commander task is assigned verbatim');
   const parsed = JSON.parse(out.content);
   A.eq(parsed.agentId, 'researcher-2', 'the new agentId comes back for the lead to delegate to');
+  A.eq(parsed.assignment.status, 'started', 'the task handoff is reported as started');
+  A.eq(parsed.assignment.mode, 'background', 'the specialist runs independently in the background');
   A.ok(!('workstation' in parsed), 'a bare-id ack claims NO desk (the station never said it placed one)');
   A.ok(!/desk/i.test(out.summary), 'and the summary stays silent about furniture it cannot source');
-  A.ok(/team\.dispatch/.test(out.summary), 'the summary nudges the lead to delegate to the new worker');
+  A.ok(/background/.test(out.summary), 'the summary confirms independent background work started');
+  A.ok(out.control && out.control.final, 'successful assignment ends the lead run instead of inviting duplicate work');
+  A.eq(out.control.reason, 'done', 'a successful background handoff ends cleanly');
+  A.ok(/available for your next request/.test(out.control.text), 'the final message frees the Overseer for new Commander work');
+}
+
+// ---- dispatch refusal is surfaced honestly; a created worker is not claimed to be working ----
+{
+  const { summonTool } = makeOrchestrationTools({ runOnce: fakeRunOnce(), roster: () => new Map(), key: 'k', model: 'm', newId: counter() });
+  const out = await summonTool.run({ name: 'Researcher', task: 'Research the market' }, {
+    agentId: 'agent', summon: async () => 'researcher-2',
+    dispatchSummonedWorker: async () => ({ ok: false, isError: true, content: 'dispatch consent denied' })
+  });
+  A.ok(out.isError, 'a refused assignment returns an error');
+  A.ok(/created, but its task was not dispatched/.test(out.content), 'the result distinguishes creation from successful assignment');
+  A.ok(out.control && out.control.final && out.control.reason === 'error', 'a failed handoff ends without the lead taking over the task');
 }
 
 // ---- THE DESK RIDES ALONG: the station acks { agentId, desk } and the tool reports WHERE it landed ----
 {
   const { summonTool } = makeOrchestrationTools({ runOnce: fakeRunOnce(), roster: () => new Map(), key: 'k', model: 'm', newId: counter() });
-  const ctx = { agentId: 'agent', summon: async () => ({ agentId: 'scout-2', desk: 'BRIDGE' }) };
-  const out = await summonTool.run({ name: 'Scout', specId: 'scout' }, ctx);
+  const ctx = {
+    agentId: 'agent', summon: async () => ({ agentId: 'scout-2', desk: 'BRIDGE' }),
+    dispatchSummonedWorker: async () => ({ ok: true, content: '[{"id":"sub-2","agentId":"scout-2","status":"running"}]' })
+  };
+  const out = await summonTool.run({ name: 'Scout', specId: 'scout', task: 'Prepare a scouting report' }, ctx);
   const parsed = JSON.parse(out.content);
   A.eq(parsed.agentId, 'scout-2', 'the object ack still yields the new agentId');
   A.eq(parsed.workstation, 'BRIDGE', 'the seeded workstation room reaches the lead');
@@ -388,7 +416,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 // ---- an object ack with NO desk (placement failed / no room) must not claim one ----
 {
   const { summonTool } = makeOrchestrationTools({ runOnce: fakeRunOnce(), roster: () => new Map(), key: 'k', model: 'm', newId: counter() });
-  const out = await summonTool.run({ name: 'Scout' }, { agentId: 'agent', summon: async () => ({ agentId: 'scout-3', desk: '' }) });
+  const out = await summonTool.run({ name: 'Scout', task: 'Prepare a scouting report' }, {
+    agentId: 'agent', summon: async () => ({ agentId: 'scout-3', desk: '' }),
+    dispatchSummonedWorker: async () => ({ ok: true, content: '[{"id":"sub-3","agentId":"scout-3","status":"running"}]' })
+  });
   A.eq(JSON.parse(out.content).agentId, 'scout-3', 'the agent is still reported as created');
   A.ok(!/desk/i.test(out.summary), 'a failed desk seed is never dressed up as a placed one');
 }
@@ -396,7 +427,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 // ---- declined / no browser: ctx.summon resolves null -> a clean "not completed", no crash ----
 {
   const { summonTool } = makeOrchestrationTools({ runOnce: fakeRunOnce(), roster: () => new Map(), key: 'k', model: 'm', newId: counter() });
-  const out = await summonTool.run({ name: 'Ghost' }, { agentId: 'agent', summon: async () => null });
+  const out = await summonTool.run({ name: 'Ghost', task: 'Prepare a scouting report' }, {
+    agentId: 'agent', summon: async () => null,
+    dispatchSummonedWorker: async () => ({ ok: true, content: 'started' })
+  });
   A.eq(out.summary, 'declined', 'a null ack (decline/timeout/disconnect) reports declined');
   A.ok(/No agent was created/.test(out.content), 'declined summon says plainly that nothing was created');
 }
@@ -412,7 +446,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 {
   const { summonTool } = makeOrchestrationTools({ runOnce: fakeRunOnce(), roster: () => new Map(), key: 'k', model: 'm', newId: counter() });
   let called = false;
-  const out = await summonTool.run({ name: '   ' }, { agentId: 'agent', summon: async () => { called = true; return 'x'; } });
+  const out = await summonTool.run({ name: '   ', task: 'A task' }, {
+    agentId: 'agent', summon: async () => { called = true; return 'x'; },
+    dispatchSummonedWorker: async () => ({ ok: true, content: 'started' })
+  });
   A.eq(out.summary, 'noop', 'an empty spec is a noop');
   A.ok(!called, 'a noop never reaches ctx.summon');
 }
@@ -429,8 +466,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
   A.ok(r1.isError && /capability denied/.test(r1.content), 'team.summon denied without the orchestrator object');
   A.eq(summoned, 0, 'a denied summon never reaches ctx.summon');
 
-  const allowCtx = makeCapCtx({ agentId: 'agent', room: 'office', hasCompute: true, tools: ['team.summon'], approvalRules: {} }, { emit: () => {}, summon });
-  const r2 = await reg.dispatch({ name: 'team.summon', args: { name: 'R', specId: 'researcher' } }, allowCtx);
+  const allowCtx = makeCapCtx({ agentId: 'agent', room: 'office', hasCompute: true, tools: ['team.summon'], approvalRules: {} }, {
+    emit: () => {}, summon, dispatchSummonedWorker: async () => ({ ok: true, content: '[{"id":"sub-registry","agentId":"researcher-2","status":"running"}]' })
+  });
+  const r2 = await reg.dispatch({ name: 'team.summon', args: { name: 'R', specId: 'researcher', task: 'Research the market' } }, allowCtx);
   A.ok(!r2.isError, 'team.summon runs when the orchestrator object is present');
   A.eq(summoned, 1, 'a granted summon reaches ctx.summon');
 }

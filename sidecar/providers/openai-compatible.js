@@ -14,6 +14,7 @@
   const isAbort = provider.runtime.isAbort;
   const delay = provider.runtime.abortableDelay;
   const RETRY_DELAYS = [400, 1200];
+  const RATE_LIMIT_RETRY_DELAYS = [5000, 10000, 20000, 40000, 60000];
   const REWARM_MIN_MS = 5 * 60 * 1000;
   // Optional request params that "OpenAI-compatible" providers disagree on. When a provider 400s and its
   // error text names one of these, we drop it and retry — the request still means the same thing without
@@ -56,6 +57,15 @@
       .replace(/\b(?:sk|api)[-_][A-Za-z0-9_-]{8,}\b/gi, '[redacted]')
       .replace(/[\r\n\t\0-\x08\x0b\x0c\x0e-\x1f\x7f]+/g, ' ')
       .replace(/\s+/g, ' ').trim().slice(0, limit || 300);
+  }
+  function rateLimitDimension(error) {
+    const type = String(error && error.type || '').toLowerCase();
+    if (type === 'tokens' || type === 'token') return 'tokens';
+    if (type === 'requests' || type === 'request') return 'requests';
+    const detail = String(error && (error.detail || error.code) || '').toLowerCase();
+    if (/\btpm\b|tokens?\s+per[- ]?(?:minute|second)|tokens?\s*\/\s*(?:min|sec)/.test(detail)) return 'tokens';
+    if (/\brpm\b|\brps\b|requests?\s+per[- ]?(?:minute|second)|requests?\s*\/\s*(?:min|sec)|generate_requests\s+per/.test(detail)) return 'requests';
+    return '';
   }
   function responseHeader(res, names) {
     if (!res || !res.headers || typeof res.headers.get !== 'function') return '';
@@ -119,6 +129,7 @@
     opts = opts || {};
     const doFetch = opts.fetch || (typeof fetch !== 'undefined' ? fetch : null);
     if (!doFetch) throw new Error('openai-compatible provider requires fetch (Node 18+) or opts.fetch');
+    const wait = typeof opts.wait === 'function' ? opts.wait : delay;
     const key = opts.key || '';
     const baseUrl = cleanBaseUrl(opts.baseUrl);
     if (!baseUrl) throw new Error((opts.label || 'openai-compatible') + ' provider has no endpoint configured (empty base URL)');
@@ -183,7 +194,17 @@
       const text = String(detail || '').toLowerCase();
       for (const p of DROPPABLE_PARAMS) {
         if (body[p] === undefined) continue;
-        if (text.indexOf(p) >= 0) { delete body[p]; rememberDrop(body.model, p); return p; }
+        if (text.indexOf(p) >= 0) {
+          // Some reasoning models reject any non-none effort alongside function tools, but explicitly
+          // accept the tools when effort is disabled. Preserve the tools and retry with that exact value.
+          if (p === 'reasoning_effort' && body.tools && body.tools.length && body.reasoning_effort !== 'none'
+            && /function tools?.*reasoning_effort.*not supported/i.test(text)) {
+            body.reasoning_effort = 'none';
+            rememberDrop(body.model, 'reasoning_effort_tools_none');
+            return p;
+          }
+          delete body[p]; rememberDrop(body.model, p); return p;
+        }
       }
       return null;
     }
@@ -234,7 +255,9 @@
       if (effort && !skip('reasoning_effort')) {
         const m = findModel(req.model);
         const modelReasons = !!(m && (m.supportsReasoning === true || (Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length)));
-        if (modelReasons || sendReasoningEffort) body.reasoning_effort = effort;
+        if (modelReasons || sendReasoningEffort) {
+          body.reasoning_effort = req.tools && req.tools.length && skip('reasoning_effort_tools_none') ? 'none' : effort;
+        }
       }
       let res;
       try { res = await requestWithRetry(body, req.signal); }
@@ -344,7 +367,8 @@
     }
 
     async function requestWithRetry(body, signal) {
-      for (let attempt = 0; ; attempt++) {
+      let transientAttempt = 0;
+      for (;;) {
         if (signal && signal.aborted) throw abortError();
         let res;
         // Fresh connect guard per attempt; disarmed the instant the fetch settles so the ceiling can't abort
@@ -359,7 +383,7 @@
           });
         } catch (e) {
           if (isAbort(e, signal)) throw e;
-          if (attempt < RETRY_DELAYS.length) { await delay(RETRY_DELAYS[attempt], signal); continue; }
+          if (transientAttempt < RETRY_DELAYS.length) { await wait(RETRY_DELAYS[transientAttempt++], signal); continue; }
           throw provider.runtime.markPreStreamRetriesExhausted(e);
         } finally {
           guard.disarm();
@@ -370,7 +394,7 @@
         // Compatibility self-heal: providers behind the "OpenAI-compatible" label reject different optional
         // params. Strip the named param and retry immediately (remembered per model, so later turns in the
         // run never pay the extra round-trip). Does not consume a transient-retry attempt.
-        if (dropUnsupportedParam(body, res.status, detail)) { attempt--; continue; }
+        if (dropUnsupportedParam(body, res.status, detail)) continue;
         // A vendor API rejecting a slash-prefixed id as an unknown/invalid model means a ROUTED-catalog id
         // (StarNet managed / OpenRouter, e.g. "openai/gpt-…") reached a direct vendor endpoint. Without this
         // line the user sees only the vendor's bare "invalid model ID" and has no path back (2026-08-25
@@ -389,7 +413,13 @@
         err.upstreamProvider = upstreamError.providerName;
         const cls = classifyApiError(err, { model: body.model });
         err.transient = cls.retryable;
-        if (cls.retryable && attempt < RETRY_DELAYS.length) { await delay(Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)), signal); continue; }
+        const retryDelays = cls.reason === 'rate_limit' && rateLimitDimension(upstreamError)
+          ? RATE_LIMIT_RETRY_DELAYS : RETRY_DELAYS;
+        if (cls.retryable && transientAttempt < retryDelays.length) {
+          const baseDelay = retryDelays[transientAttempt++];
+          await wait(Math.min(60000, Math.max(baseDelay, cls.retryAfterMs || 0)), signal);
+          continue;
+        }
         throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err) : err;
       }
     }

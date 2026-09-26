@@ -372,7 +372,8 @@
         }
       },
       run: async (args, ctx) => {
-        if (typeof runOnce !== 'function') return { content: 'orchestration unavailable (no run host)', summary: 'error' };
+        if (typeof runOnce !== 'function') return { content: 'orchestration unavailable (no run host)', summary: 'error',
+          control: { final: true, reason: 'error', text: 'Delegation is unavailable on this run. I will not take over the task; resolve delegation or explicitly direct me to do it myself.' } };
         const leadId = (ctx && ctx.agentId) || 'agent';
         const crew = roster() || new Map();
         // NO SILENT CAPS (2026-07-26 orchestration audit): the cap used to `slice(0, maxWorkers)` and say nothing,
@@ -573,7 +574,8 @@
         };
 
         if (args.background) {
-          if (!subagents || typeof subagents.start !== 'function') return { content: 'background subagents unavailable (no subagent manager)', summary: 'error' };
+          if (!subagents || typeof subagents.start !== 'function') return { content: 'background subagents unavailable (no subagent manager)', summary: 'error',
+            control: { final: true, reason: 'error', text: 'Background delegation is unavailable. I will not take over the task; resolve the dispatch issue or explicitly direct me to do it myself.' } };
           const started = jobs.map(job => {
             if (job.error) return { agentId: job.agentId, reason: 'error', result: job.error };
             return subagents.start({ ...projectOptions(job.sessionContext || ctx), leadId, parentStreamId: deps.coordinateResults === true && ctx && ctx.streamId !== 'global' ? ctx.streamId : '', streamId: job.streamId || '', agentId: job.agentId, prompt: job.prompt, context: job.context, runId: newId(), resultSchema: job.resultSchema }, async (h) => {
@@ -588,7 +590,15 @@
             } catch (_) {}
           }
           const startedRows = started.concat(overflowRows());
-          return { content: JSON.stringify(startedRows), summary: 'started ' + started.filter(r => r && r.id).length + ' background worker(s)' + overflowNote };
+          const startedCount = started.filter(r => r && r.id).length;
+          const failures = startedRows.filter(r => !r || !r.id).map(r => String((r && r.agentId) || '(unnamed)') + ': '
+            + String((r && r.reason) || 'not-dispatched') + ' — ' + String((r && r.result) || 'no dispatch detail').slice(0, 500));
+          const controlText = startedCount
+            ? 'I handed this task to ' + startedCount + ' background worker(s). I will not duplicate their work; I will report their results when they finish.'
+            : 'I could not start a background worker for this task. I will not take over the delegated work; resolve the reported dispatch issue or give me a different instruction.';
+          return { content: JSON.stringify(startedRows), summary: 'started ' + startedCount + ' background worker(s)' + overflowNote,
+            control: { final: true, reason: startedCount ? 'done' : 'error',
+              text: controlText + (failures.length ? '\n\nDispatch issues:\n' + failures.join('\n').slice(0, 3000) : '') } };
         }
 
         /* WAVES — one code path for both modes (2026-07-26 audit findings A + B).
@@ -808,8 +818,9 @@
     // Commander takes in the Recruitment Bay. CONTRACT: emits crew.summon.request down the run stream (added to
     // shared/events.js); the browser runs the real summonAgent() and POSTs /api/summon/ack with the new agentId,
     // which resolves ctx.summon (mirroring the consent round-trip). The new id is returned so the lead can hand it
-    // work with team.dispatch in the SAME run. consent-gated (APPROVAL beat); ctx.summon is only present on a
-    // live interactive lead run, so a headless/worker call degrades to a clear "not available" message.
+    // work immediately with team.dispatch in the SAME run. The host bridge re-enters central dispatch, so the
+    // dispatch consent and all ordinary policy gates still apply. ctx.summon is only present on a live interactive
+    // lead run, so a headless/worker call degrades to a clear "not available" message.
     // THE DESK RIDES ALONG: an agent created because the Commander asked for one is useless standing on bare
     // deck, so the browser's summon seeds that agent's workstation too and reports WHERE on the ack. That is the
     // only prop this path places, and only for the agent being created — team.summon is not a build tool.
@@ -824,10 +835,11 @@
       // completed" instead of tripping the 30s fast-tool default mid-wait. The happy path acks in well under a second.
       timeoutMs: 180000,
       name: 'team.summon', capability: 'orchestrator', scope: 'write', requiresConsent: true,
-      description: 'Summon a NEW specialist agent onto the crew for the Commander, live — the same thing they would do in the Recruitment Bay. Use this when a specialist you need does not exist yet; if it is already listed under YOUR TEAM, delegate to it with team.dispatch instead. Pick a class with specId (one of: ' + SPEC_IDS + ') or describe a custom one with name + purpose. The station places the new agent\'s workstation with it, so never tell the Commander to go build it a desk. Returns the new agentId, which you can immediately delegate to. In APPROVAL mode the Commander confirms the summon first.',
+      description: 'Summon a NEW specialist agent onto the crew for the Commander, live. Use this when a specialist you need does not exist yet; if it is already listed under YOUR TEAM, delegate with team.dispatch instead. Pick a class with specId (one of: ' + SPEC_IDS + ') or describe a custom one with name + purpose, and provide task with the actual work request. After the Commander confirms the summon, the host automatically starts task on that specialist with background:true through the normal consent-gated team.dispatch path. You stay available in COMMS while the worker runs. The station places the new agent\'s workstation with it, so never tell the Commander to go build it a desk.',
       schema: {
-        type: 'object', required: ['name'], properties: {
+        type: 'object', required: ['name', 'task'], properties: {
           name: { type: 'string' },        // the new agent's display name (e.g. "RESEARCHER")
+          task: { type: 'string', description: 'The actual Commander-requested work this new specialist must complete. Make it self-contained; this starts automatically in the background.' },
           specId: { type: 'string' },       // optional built-in class to base it on (see SPEC_IDS)
           purpose: { type: 'string' },      // optional standing orders for a custom class
           persona: { type: 'string' },      // optional voice/persona id
@@ -845,6 +857,9 @@
           skin: String(a.skin || '').trim().slice(0, 40)
         };
         if (!spec.name && !spec.specId) return { content: 'Provide a name or a specId for the new agent.', summary: 'noop' };
+        const task = String(a.task || '').trim();
+        if (!task) return { content: 'Include task with the work this new specialist should complete; no agent was summoned.', summary: 'task-required' };
+        if (typeof ctx.dispatchSummonedWorker !== 'function') return { content: 'Automatic task handoff is unavailable on this run; no agent was summoned.', summary: 'unavailable' };
         let ack;
         try { ack = await ctx.summon(spec); }
         catch (e) { return { content: 'summon failed: ' + ((e && e.message) || e), summary: 'error' }; }
@@ -852,6 +867,39 @@
         const newId = (ack && typeof ack === 'object') ? ack.agentId : ack;
         const desk = (ack && typeof ack === 'object' && ack.desk) ? String(ack.desk) : '';
         if (!newId) return { content: 'The summon was not completed — the Commander declined it, or the station did not respond. No agent was created.', summary: 'declined' };
+        let assignment;
+        try { assignment = await ctx.dispatchSummonedWorker({ agentId: String(newId), task }, ctx); }
+        catch (e) {
+          const detail = ((e && e.message) || e);
+          return {
+            ok: false, isError: true,
+            content: 'Specialist ' + String(newId) + ' was created, but its task was not dispatched: ' + detail,
+            summary: 'summoned but not dispatched',
+            control: { final: true, reason: 'error', text: 'The specialist was created, but I could not hand off the task. I will not continue it myself; resolve the dispatch issue before retrying.' }
+          };
+        }
+        if (!assignment || assignment.ok === false || assignment.isError) {
+          const reason = (assignment && (assignment.content || assignment.summary)) || 'dispatch was refused';
+          return {
+            ok: false, isError: true,
+            content: 'Specialist ' + String(newId) + ' was created, but its task was not dispatched: ' + reason,
+            summary: 'summoned but not dispatched',
+            control: { final: true, reason: 'error', text: 'The specialist was created, but dispatch was refused. I will not continue the task myself; approve or resolve the dispatch, then retry.' }
+          };
+        }
+        let rows = null;
+        try { rows = JSON.parse(String(assignment.content || '')); } catch (_) {}
+        const workerStarted = Array.isArray(rows) && rows.some(row => row && String(row.agentId || '') === String(newId) && row.id && row.status === 'running');
+        if (!workerStarted) {
+          const row = Array.isArray(rows) && rows.find(item => item && String(item.agentId || '') === String(newId));
+          const reason = row && (row.result || row.reason) || 'team.dispatch did not return a running background-worker handle';
+          return {
+            ok: false, isError: true,
+            content: 'Specialist ' + String(newId) + ' was created, but its task was not started: ' + reason,
+            summary: 'summoned but not dispatched',
+            control: { final: true, reason: 'error', text: 'The specialist was created, but no running worker accepted the task. I will not continue it myself; resolve the dispatch issue before retrying.' }
+          };
+        }
         if (journeyStore) {
           try {
             await journeyStore.confirmStarnetMilestone('recruited_first_specialist', 'Summoned specialist ' + String(newId) + ' with team.summon.', now());
@@ -863,7 +911,12 @@
         // Worded "workstation is in X", not "placed": the station may have bound a free desk it already had.
         const out = { agentId: newId, name: spec.name || spec.specId };
         if (desk) out.workstation = desk;
-        return { content: JSON.stringify(out), summary: 'summoned ' + newId + (desk ? ' (workstation in ' + desk + ')' : '') + ' — now delegate work to it with team.dispatch' };
+        out.assignment = { status: 'started', mode: 'background', result: String(assignment.content || '') };
+        const handoff = 'The task is assigned to ' + (spec.name || spec.specId) + ' and the worker has started in the background. I am available for your next request and will not duplicate that work.';
+        return {
+          content: JSON.stringify(out), summary: 'summoned ' + newId + ' and started its task in the background' + (desk ? ' (workstation in ' + desk + ')' : ''),
+          control: { final: true, reason: 'done', text: handoff }
+        };
       }
     };
 

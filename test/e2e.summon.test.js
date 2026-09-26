@@ -2,7 +2,8 @@
    MOCK OpenRouter that makes the lead call team.summon, then ACTS AS THE BROWSER: it reads crew.summon.request off
    the live run stream and POSTs /api/summon/ack with a freshly-"minted" agentId, exactly as the Recruitment Bay's
    summonAgent() would. Proves the whole chain wires together — model → tool → crew.summon.request → ack → the new
-   id flows back into the model's NEXT request so the lead can delegate to the worker. No real key/model/browser.
+  task is automatically handed to the new worker through team.dispatch(background:true), which starts its own run.
+  No real key/model/browser.
 
    NOT in test:fast (a child-process boot test shouldn't gate other agents' merges); run via `npm run test:http`. */
 'use strict';
@@ -16,12 +17,13 @@ const { spawn } = require('child_process');
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
 
-// mock OpenRouter: /models -> a minimal catalog; /chat/completions -> the FIRST call returns a team_summon tool
-// call (wire name uses underscores), every later call returns a short final completion. Captures each request so
-// the test can assert what the model SAW after the tool returned.
+// Mock OpenRouter: the lead summons a researcher with a task, a distinct worker run returns its own result, and
+// the lead then finishes. Captures each request so the test can distinguish an actual worker run from lead prose.
 function startMockOpenRouter() {
   const requests = [];
-  let n = 0;
+  const workerRequests = [];
+  let resolveWorkerRequest;
+  const workerStarted = new Promise(resolve => { resolveWorkerRequest = resolve; });
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.url.indexOf('/models') >= 0) {
@@ -31,14 +33,21 @@ function startMockOpenRouter() {
       }
       if (req.url.indexOf('/chat/completions') >= 0) {
         let body = ''; req.on('data', d => { body += d; }); req.on('end', () => {
-          try { requests.push(JSON.parse(body)); } catch (_) {}
+          let request = {};
+          try { request = JSON.parse(body); requests.push(request); } catch (_) {}
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-          if (++n === 1) {
-            // the lead decides to create a researcher: a single complete tool_call delta, then finish_reason
-            res.write('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_summon', type: 'function', function: { name: 'team_summon', arguments: JSON.stringify({ name: 'RESEARCHER', specId: 'researcher' }) } }] } }] }) + '\n\n');
+          const isLeadContinuation = (request.messages || []).some(m => m && m.role === 'assistant' && Array.isArray(m.tool_calls));
+          if (requests.length === 1) {
+            // The lead must provide the actual Commander task as part of the summon contract.
+            res.write('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_summon', type: 'function', function: { name: 'team_summon', arguments: JSON.stringify({ name: 'RESEARCHER', specId: 'researcher', task: 'Research potential business names for a new company.' }) } }] } }] }) + '\n\n');
             res.write('data: ' + JSON.stringify({ choices: [{ finish_reason: 'tool_calls', delta: {} }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } }) + '\n\n');
-          } else {
+          } else if (isLeadContinuation) {
             res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Done — RESEARCHER is on the crew.' } }] }) + '\n\n');
+            res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 6, total_tokens: 18 } }) + '\n\n');
+          } else {
+            workerRequests.push(request);
+            resolveWorkerRequest(request);
+            res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: 'I researched several potential business names and returned the findings.' } }] }) + '\n\n');
             res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 6, total_tokens: 18 } }) + '\n\n');
           }
           res.write('data: [DONE]\n\n');
@@ -48,7 +57,7 @@ function startMockOpenRouter() {
       }
       res.writeHead(404); res.end();
     });
-    server.listen(0, HOST, () => resolve({ server, requests, base: 'http://' + HOST + ':' + server.address().port + '/api/v1' }));
+    server.listen(0, HOST, () => resolve({ server, requests, workerRequests, workerStarted, base: 'http://' + HOST + ':' + server.address().port + '/api/v1' }));
   });
 }
 
@@ -83,11 +92,11 @@ function boot(port, env, attemptsLeft) {
     const token = await bootToken(B, B);
     A.ok(token.length >= 32, 'got a session API token');
 
-    // drive a real streaming lead run; the mock makes it call team.summon
+    // Drive a real streaming lead run; the mock makes it summon and assign a business-name research task.
     const res = await fetch(B + '/api/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B },
-      body: JSON.stringify({ key: 'sk-or-v1-fake', model: 'test/model', agentId: 'agent', isTask: true, messages: [{ role: 'user', content: 'summon a research agent for me' }] })
+      body: JSON.stringify({ key: 'sk-or-v1-fake', model: 'test/model', agentId: 'agent', isTask: true, messages: [{ role: 'user', content: 'Research potential business names for a new company.' }] })
     });
     A.eq(res.status, 200, 'POST /api/run streams (200)');
 
@@ -107,6 +116,15 @@ function boot(port, env, attemptsLeft) {
         // ACT AS THE BROWSER: the station ran summonAgent() and reports the new agentId back, unblocking the tool.
         if (ev.name === 'crew.summon.request' && !ackPosted) {
           summonReq = ev.payload; ackPosted = true;
+          const roster = await fetch(B + '/api/roster', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B },
+            body: JSON.stringify({ updatedAt: Date.now(), agents: [
+              { agentId: 'agent', name: 'Overseer', system: '', model: 'test/model', provider: 'openrouter' },
+              { agentId: 'researcher-2', name: 'RESEARCHER', system: 'Research potential business names.', model: 'test/model', provider: 'openrouter' }
+            ] })
+          });
+          A.eq(roster.status, 200, 'the browser syncs the new specialist roster before acknowledging summon');
+          A.ok((await roster.json()).ok, 'the sidecar confirms the worker roster landed');
           await fetch(B + '/api/summon/ack', {
             method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B },
             // `desk` = where the station's summonAgent() actually seeded the new worker's workstation
@@ -124,23 +142,34 @@ function boot(port, env, attemptsLeft) {
     A.eq(summonReq.agentId, 'agent', 'summon request is attributed to the requesting lead');
 
     // 2) the run completed cleanly — the tool resolved on our ack and the model gave a final answer
-    const ends = events.filter(e => e.name === 'agent.run.end');
+    const ends = events.filter(e => e.name === 'agent.run.end' && e.payload.runId === runId);
     A.eq(ends.length, 1, 'exactly one agent.run.end');
-    A.eq(ends[0].payload.reason, 'done', 'the run completes with reason done');
+    A.eq(ends[0].payload.reason, 'done', 'the lead turn completes cleanly after handoff');
 
     // 3) the team.summon tool returned OK (it received our new agentId, not an error)
     const toolResults = events.filter(e => e.name === 'agent.tool_result');
     A.ok(toolResults.some(e => e.payload.ok && !e.payload.isError), 'the team.summon tool returned ok');
 
-    // 4) THE PROOF: the new agentId flowed back into the model's SECOND request as the tool result, so the lead
-    //    can now delegate to the worker it just created.
-    A.ok(mock.requests.length >= 2, 'the model was called again after the tool returned');
-    const second = mock.requests[mock.requests.length - 1];
-    A.ok(JSON.stringify(second.messages || []).indexOf('researcher-2') >= 0, 'the new agentId reached the model (ready for team.dispatch)');
+    // 4) THE PROOF: the host dispatched the new specialist through the central team.dispatch path.
+    const dispatchCalls = events.filter(e => e.name === 'agent.tool_call' && e.payload.name === 'team.dispatch');
+    A.eq(dispatchCalls.length, 1, 'summoning a task automatically emits one team.dispatch call');
+    A.ok(JSON.stringify(dispatchCalls[0].payload).includes('Research potential business names'), 'dispatch carries the Commander task');
+    A.ok(events.some(e => e.name === 'agent.tool_result' && e.payload.callId === dispatchCalls[0].payload.callId && e.payload.ok), 'the generated team.dispatch call succeeds');
 
-    // 5) THE DESK RIDES ALONG: the workstation the station seeded with the new agent reaches the lead too, so it
-    //    never tells the Commander to go build one. Sourced ONLY from the ack — the sidecar invents nothing.
-    A.ok(JSON.stringify(second.messages || []).indexOf('BRIDGE') >= 0, 'the seeded workstation location reached the model');
+    // 5) A separate provider request proves the worker started its own agent loop with the assigned task.
+    const workerRequest = await Promise.race([
+      mock.workerStarted,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the independent worker run never reached the provider')), 5000))
+    ]);
+    A.eq(mock.workerRequests.length, 1, 'exactly one independent worker provider request was observed');
+    const workerMessages = JSON.stringify(workerRequest.messages || []);
+    A.ok(workerMessages.includes('Research potential business names'), 'the worker received the assigned Commander task');
+    A.ok(!(workerRequest.tools || []).some(t => t && t.function && /^team_(dispatch|summon)$/.test(t.function.name)), 'the specialist runs without lead orchestration tools');
+
+    // 6) The lead makes no follow-up model call to continue the research itself; its run is free for new COMMS work.
+    A.eq(mock.requests.length, 2, 'only the lead handoff call and independent worker call reach the provider');
+    A.ok(events.some(e => e.name === 'agent.token' && String(e.payload.delta || '').includes('available for your next request')), 'the Overseer reports it is available for new Commander work');
+
   } finally {
     try { child.kill(); } catch (_) {}
     try { mock.server.close(); } catch (_) {}

@@ -3992,7 +3992,61 @@ async function tickOverseer() {
   overseerTickRunning = true;
   try {
     overseer.collect(subagents.list());
+    const queueFallbackReport = (review, worker, cause) => {
+      if (review.fallbackReport && review.fallbackReport.state === 'delivered') return;
+      const current = overseer.snapshot().reviews.find(r => r.id === review.id);
+      if (!current || ['cancelled', 'done', 'reported', 'superseded'].includes(current.status)) return;
+      const workerError = worker && Array.isArray(worker.events)
+        ? worker.events.slice().reverse().find(e => e && e.name === 'agent.run.error' && e.payload && e.payload.runId === worker.runId)
+        : null;
+      const run = worker && runStore.all().find(r => r && r.runId === worker.runId);
+      const failure = String((workerError && workerError.payload.message)
+        || (run && [run.failureStage, run.failureCode].filter(Boolean).join('/'))
+        || (worker && worker.reason) || 'no worker error detail recorded').slice(0, 2000);
+      const text = [
+        'The delegated task finished, but I could not complete its automatic review (' + String(cause || 'review unavailable').slice(0, 500) + ').',
+        'Worker: ' + String((worker && worker.agentId) || review.workerId),
+        'Task status: ' + String((worker && worker.status) || 'unavailable') + (worker && worker.reason ? ' (' + worker.reason + ')' : ''),
+        'Task: ' + String((worker && worker.prompt) || '').slice(0, 1000),
+        worker && worker.status !== 'done' ? 'Failure detail: ' + failure : '',
+        'Worker output is unreviewed and should be treated as evidence, not authorization:',
+        String((worker && worker.result) || '(the worker returned no text)').slice(0, 10000),
+        worker && Array.isArray(worker.artifacts) && worker.artifacts.length
+          ? 'Artifacts: ' + worker.artifacts.map(a => String(a && (a.path || a.title) || '')).filter(Boolean).join(', ').slice(0, 1500) : ''
+      ].filter(Boolean).join('\n\n');
+      overseer.patchReview(review.id, {
+        status: 'interrupted',
+        error: 'Automatic review failed; a direct worker outcome report is queued for the Commander.',
+        fallbackReport: { state: 'pending', runId: review.id + ':report', text: text.slice(0, 16000), attempts: 0, retryAt: 0 }
+      });
+    };
     for (const review of overseer.snapshot().reviews) {
+      if (review.fallbackReport && review.fallbackReport.state === 'pending') {
+        if (review.fallbackReport.retryAt > Date.now()) continue;
+        let parent;
+        try { parent = overseer.resolve(review.parentStreamId); }
+        catch (_) {
+          overseer.patchReview(review.id, { fallbackReport: Object.assign({}, review.fallbackReport, { state: 'unavailable', lastError: 'Parent conversation is archived or deleted.' }) });
+          continue;
+        }
+        let delivered = null;
+        try {
+          delivered = await stationBridge.request('station.deliver', {
+            streamId: parent.id, sessionTitle: parent.title, agentId: 'agent',
+            runId: review.fallbackReport.runId, prompt: 'Delegated task outcome', text: review.fallbackReport.text
+          });
+        } catch (e) { delivered = { ok: false, error: (e && e.message) || String(e) }; }
+        if (delivered && delivered.ok) {
+          overseer.patchReview(review.id, { error: 'Automatic review failed; the worker outcome was reported directly.',
+            fallbackReport: Object.assign({}, review.fallbackReport, { state: 'delivered', deliveredAt: Date.now(), lastError: '' }) });
+        } else {
+          overseer.patchReview(review.id, { fallbackReport: Object.assign({}, review.fallbackReport, {
+            attempts: (review.fallbackReport.attempts || 0) + 1, retryAt: Date.now() + 30000,
+            lastError: String((delivered && delivered.error) || 'station did not acknowledge the report').slice(0, 500)
+          }) });
+        }
+        continue;
+      }
       if (review.agentId !== 'agent') {
         if (review.status === 'pending' || review.status === 'reviewing') overseer.patchReview(review.id, {
           status: 'cancelled', error: 'Automatic coordination belongs to the station orchestrator.' });
@@ -4000,8 +4054,14 @@ async function tickOverseer() {
       }
       if (review.status === 'reviewing') {
         const proof = runStore.all().find(r => r.runId === review.reviewRunId);
-        overseer.patchReview(review.id, { status: proof && proof.reason === 'done' ? 'done' : 'interrupted',
-          error: proof && proof.reason === 'done' ? '' : 'Review interrupted; inspect the saved run before continuing.' });
+        if (proof && proof.reason === 'done') overseer.patchReview(review.id, { status: 'done', error: '' });
+        else if (review.fallbackReport && review.fallbackReport.state === 'delivered') {
+          overseer.patchReview(review.id, { status: 'interrupted', error: 'Review interrupted; the worker outcome was reported directly.' });
+        } else {
+          const worker = subagents.get(review.workerId);
+          if (worker && worker.runId === review.workerRunId) queueFallbackReport(review, worker, 'review was interrupted');
+          else overseer.patchReview(review.id, { status: 'interrupted', error: 'Review interrupted and the worker record is unavailable.' });
+        }
         continue;
       }
       if (review.status !== 'pending') continue;
@@ -4009,19 +4069,26 @@ async function tickOverseer() {
       try { parent = overseer.resolve(review.parentStreamId); }
       catch (_) { overseer.patchReview(review.id, { status: 'cancelled', error: 'Parent conversation is archived or deleted.' }); continue; }
       if (parent.projectRoot && !isBlessedRoot(parent.projectRoot)) {
-        overseer.patchReview(review.id, { status: 'interrupted', error: 'The parent project is no longer trusted. Restore its project access before continuing.' }); continue;
+        const worker = subagents.get(review.workerId);
+        if (worker && worker.runId === review.workerRunId) queueFallbackReport(review, worker, 'the parent project is no longer trusted for review');
+        else overseer.patchReview(review.id, { status: 'interrupted', error: 'The parent project is no longer trusted and the worker record is unavailable.' });
+        continue;
       }
       const ident = agentRoster.get(review.agentId) || {};
       const provider = normalizeProvider(ident.provider || '');
       const key = providerRuntimeKey(provider, '');
       const baseUrl = providerRuntimeBaseUrl(provider, '');
-      if (!providerHasCredential(provider, key, baseUrl)) {
-        if (!review.error) overseer.patchReview(review.id, { error: 'Connect the overseer provider to review this result.' });
-        continue;
-      }
       let worker = subagents.get(review.workerId);
       if (!worker || worker.runId !== review.workerRunId) {
         overseer.patchReview(review.id, { status: 'superseded', error: 'Worker has a newer attempt.' }); continue;
+      }
+      if (worker.status !== 'done') {
+        queueFallbackReport(review, worker, 'the worker finished without a successful result');
+        continue;
+      }
+      if (!providerHasCredential(provider, key, baseUrl)) {
+        queueFallbackReport(review, worker, 'the Overseer provider is not connected');
+        continue;
       }
       await overseer.withThread(parent.id, async () => {
         if (updateWritesFrozen || overseer.snapshot().paused || !overseer.snapshot().reviews.some(r => r.id === review.id && r.status === 'pending')) return;
@@ -4041,6 +4108,11 @@ async function tickOverseer() {
           const current = overseer.snapshot().reviews.find(r => r.id === review.id);
           if (current && current.status === 'reviewing' && current.reviewRunId === runId) overseer.patchReview(review.id, fields);
         };
+        const finishReview = () => {
+          const proof = runStore.all().find(r => r.runId === runId);
+          if (proof && proof.reason === 'done') settleReview({ status: 'done', error: '' });
+          else queueFallbackReport(review, worker, String((proof && [proof.failureStage, proof.failureCode].filter(Boolean).join('/')) || 'review did not finish'));
+        };
         runs.set(runId, reviewAbort);
         runsMeta.set(runId, { agentId: review.agentId, startedAt: Date.now(), source: 'overseer', streamId: parent.id });
         const instruction = 'Review the background work you delegated for this conversation. Inspect its evidence, '
@@ -4057,10 +4129,8 @@ async function tickOverseer() {
             projectRoot: parent.projectRoot || '', workdir: parent.projectRoot || undefined, sessionTitle: parent.title,
             sessionPrompt: 'Review delegated result', emit: chanEmit,
             messages: transcriptStore.reconstruct(parent.id, { limit: 80 }).concat([{ role: 'user', content: instruction }]) });
-          const proof = runStore.all().find(r => r.runId === runId);
-          settleReview({ status: proof && proof.reason === 'done' ? 'done' : 'interrupted',
-            error: proof && proof.reason === 'done' ? '' : 'Review did not finish; inspect the saved run.' });
-        } catch (e) { settleReview({ status: 'interrupted', error: String(e.message).slice(0, 300) }); }
+          finishReview();
+        } catch (e) { queueFallbackReport(review, worker, String(e.message).slice(0, 500)); }
         finally { runs.delete(runId); runsMeta.delete(runId); grantsSession.delete(runId); }
       });
     }
@@ -16956,6 +17026,34 @@ async function runOnceCore(o) {
     return r;
   };
 
+  // A successful summon must hand its task to the new specialist before the lead continues. This is a
+  // host-only bridge into the ordinary central dispatcher: team.dispatch still passes capability, consent,
+  // taint, hooks, budgets, and recovery journaling. Keep the generated call narrow and background-only.
+  capCtx.dispatchSummonedWorker = async (request, parentCtx) => {
+    const task = request && String(request.task || '').trim();
+    const workerId = request && String(request.agentId || '').trim();
+    if (!task || !workerId) return { ok: false, isError: true, summary: 'invalid-handoff', content: 'A worker id and non-empty task are required.' };
+    const args = { workers: [{ agentId: workerId, prompt: task }], background: true };
+    const argsRaw = JSON.stringify(args);
+    const parent = parentCtx || capCtx;
+    const callId = String(parent.callId || 'team_summon') + ':dispatch';
+    const call = { id: callId, name: 'team.dispatch', args, argsRaw };
+    emit('agent.tool_call', { agentId, runId, callId, name: call.name, argsSummary: argsRaw.slice(0, 240) });
+    const startedAt = Date.now();
+    let result;
+    try {
+      result = await dispatch(call, Object.assign({}, parent, { callId }));
+    } catch (e) {
+      emit('agent.tool_result', { agentId, runId, callId, ok: false, ms: Math.max(0, Date.now() - startedAt), summary: 'error', isError: true });
+      throw e;
+    }
+    emit('agent.tool_result', {
+      agentId, runId, callId, ok: !!(result && result.ok), ms: Math.max(0, Date.now() - startedAt),
+      summary: (result && result.summary) || (result && result.isError ? 'error' : 'ok'), isError: !!(result && result.isError)
+    });
+    return result;
+  };
+
   // CODE MODE COMPOSITION. The child process gets no registry, credentials or ambient authority; every
   // `tool(name,args)` crosses this function and re-enters the SAME dispatch closure used by ordinary model
   // calls. That preserves live withholding, authority, hooks, taint latching, output budgets and the run
@@ -17104,15 +17202,15 @@ async function runOnceCore(o) {
       if (error.message !== 'no such session') failNote('project.context', error);
     }
     teamNote = '\n\n[ORCHESTRATION] You are the lead orchestrator. You can build and direct a crew for the Commander:';
-    if (require('./overseer.js').isCoordinatorRun({ ...o, agentId, surface })) teamNote += '\nCoordinate the Commander\'s existing station crew from this conversation. Handle only truly quick work directly: a trivial answer, a tiny clarification, or a result you can produce in a few seconds without meaningful research, browsing, or execution. '
-      + 'For research, multi-step investigation, browsing, or anything likely to keep this conversation occupied, prefer delegation over solo work. Reuse a suitable existing specialist first when their role fits and their status suggests they are available; if the right specialist does not exist yet, summon it instead of doing the whole job yourself. Your default stance is manager, not worker: stay available in this conversation, push substantive work outward, and review and synthesize results when specialists report back. '
+    if (require('./overseer.js').isCoordinatorRun({ ...o, agentId, surface })) teamNote += '\nCoordinate the Commander\'s existing station crew from this conversation. Do not personally perform substantive work that a suitable specialist can take. The Commander asking you to achieve an outcome is not permission to do the work yourself; only handle a delegable task directly when the Commander explicitly tells you to do it yourself or not to delegate. '
+      + 'Reuse a suitable existing specialist first when their role fits and their status suggests they are available; if the right specialist does not exist yet, summon it instead of doing the whole job yourself. Your default stance is manager, not worker: stay available in this conversation, push substantive work outward, and review and synthesize results when specialists report back. '
       + 'You are also the Commander\'s StarNet guide inside the app. Use the StarNet operator knowledge already in your prompt, the live harness truth from station.inspect, your current capabilities ground truth, and your memory/dossier facilities to track how far the Commander has progressed from onboarding toward autonomous use. Notice when a StarNet-native move would help — a prop to place, a room to build, a specialist to recruit, a routine to create, a connector to add, a session to split out, a workflow to route — and suggest it once, briefly, when it is genuinely useful. If the current goal is being slowed, blocked, or made clumsy by something the station is missing, name the concrete upgrade: the missing capability prop, the missing specialist, the missing connector route, the missing automation, or the missing session structure. Record that guidance in memory when you can so you do not keep repeating it. As the Commander shows they already know a surface or have successfully used it before, back off the teaching and bias toward concise orchestration. '
       + 'Use the agents the Commander has already created, choosing by their roles and instructions. '
       + 'Do not create a replacement crew or require a special General session. '
       + (projectConversation
         ? 'For independent or long-running project work, dispatch with background:true and omit session. The project activity feed exposes the worker; do not create additional working sessions by default. Background results return here automatically for your review. '
         : 'For independent or long-running work, inspect existing sessions, reuse the relevant thread or create a named working session, then dispatch with background:true and its session id. Background results return here automatically for your review. ')
-      + 'Keep the Commander free to continue talking; never switch their focus just because you delegated. '
+      + 'Keep the Commander free to continue talking; never switch their focus just because you delegated. A background team.dispatch is a handoff, not permission to work in parallel: end your turn after dispatch and do not repeat or continue the assigned subtask. If the Commander explicitly directs you to do delegable work yourself, do that instead of creating a background handoff for the same work. '
       + 'Route follow-ups to existing work; inspect worker status and generation before steering. '
       + 'Project context stays scoped to the relevant thread; read its decisions before acting. '
       + 'A completed worker is evidence to review, not proof the overall objective is done.';
@@ -17149,8 +17247,9 @@ async function runOnceCore(o) {
     const classListLine = SPECIALIST_CLASSES.map(c => c.id + (c.tagline ? ' — ' + c.tagline : '')).join('; ');
     teamNote += '\n• SUMMON a NEW specialist with team.summon when the Commander wants an agent you don\'t have yet '
       + '(e.g. "create a research agent for me"): pass a class via specId — one of: ' + classListLine + ' — '
-      + 'or a custom name + purpose. It returns the new '
-      + 'agentId, which you can immediately hand work to with team.dispatch. When the Commander asks you to create or '
+      + 'or a custom name + purpose, and include task with the Commander\'s actual work request. Summoning automatically '
+      + 'starts that task on the new specialist in the background through team.dispatch; do not continue the specialist\'s '
+      + 'work yourself. You remain available in COMMS while it runs. When the Commander asks you to create or '
       + 'summon an agent, actually DO it with team.summon — don\'t just describe it or claim you cannot. When the '
       + 'task clearly needs a specialist you do not have, summon it proactively rather than settling into a long solo run. '
       + 'For scheduled work, create StarNet routines with routine_create; if the work clearly belongs to a specialist '

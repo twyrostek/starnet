@@ -84,6 +84,71 @@ module.exports = (async () => {
     A.eq(JSON.parse(calls[0].init.body).stream_options, { include_usage: true }, 'optional usage include is wired');
   }
 
+  // Explicit OpenAI request-per-minute 429s get a bounded exponential backoff; Retry-After can extend it.
+  {
+    let posts = 0;
+    const waits = [];
+    const fetchImpl = async (_url, init) => {
+      if (!init || init.method !== 'POST') return new Response('{"data":[]}');
+      posts++;
+      if (posts === 1) return new Response('{"error":{"message":"Rate limit reached on requests per minute (RPM)"}}', { status: 429 });
+      if (posts === 2) return new Response('{"error":{"message":"Rate limit reached on requests per minute (RPM)"}}', { status: 429, headers: { 'retry-after': '15' } });
+      return new Response('data: [DONE]\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const p = makeOpenAICompatibleProvider({ fetch: fetchImpl, baseUrl: 'https://api.openai.com/v1', wait: async ms => waits.push(ms) });
+    await collect(p, { model: 'gpt-5-luna', messages: [{ role: 'user', content: 'hi' }] });
+    A.eq(posts, 3, 'a transient 429 recovers after retrying');
+    A.eq(waits, [5000, 15000], 'request-limit waits grow exponentially and honor Retry-After');
+  }
+
+  // Explicit token-throughput limits (TPS) also receive exponential retries.
+  {
+    let posts = 0;
+    const waits = [];
+    const fetchImpl = async (_url, init) => {
+      if (!init || init.method !== 'POST') return new Response('{"data":[]}');
+      posts++;
+      if (posts < 3) return new Response('{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"Rate limit reached on tokens per second (TPS)"}}', { status: 429 });
+      return new Response('data: [DONE]\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const p = makeOpenAICompatibleProvider({ fetch: fetchImpl, baseUrl: 'https://api.openai.com/v1', wait: async ms => waits.push(ms) });
+    await collect(p, { model: 'gpt-5-luna', messages: [] });
+    A.eq(posts, 3, 'token-throughput 429s recover after retrying');
+    A.eq(waits, [5000, 10000], 'token-throughput 429s use the exponential backoff');
+  }
+
+  // Retry budget stays bounded, and a 429 that signals exhausted credits is not retried.
+  {
+    let posts = 0;
+    const waits = [];
+    const fetchImpl = async (_url, init) => {
+      if (!init || init.method !== 'POST') return new Response('{"data":[]}');
+      posts++;
+      return new Response('{"error":{"message":"Rate limit reached on requests per minute (RPM)"}}', { status: 429 });
+    };
+    const p = makeOpenAICompatibleProvider({ fetch: fetchImpl, baseUrl: 'https://api.openai.com/v1', wait: async ms => waits.push(ms) });
+    let err = null;
+    try { await collect(p, { model: 'gpt-5-luna', messages: [] }); } catch (e) { err = e; }
+    A.ok(err && err.preStreamRetriesExhausted, 'exhausting 429 retries marks the pre-stream retry ladder exhausted');
+    A.eq(posts, 6, 'rate-limit retries stop after five retries');
+    A.eq(waits, [5000, 10000, 20000, 40000, 60000], 'the 429 backoff doubles and caps at one minute');
+
+    posts = 0;
+    waits.length = 0;
+    const quotaProvider = makeOpenAICompatibleProvider({
+      fetch: async (_url, init) => {
+        if (!init || init.method !== 'POST') return new Response('{"data":[]}');
+        posts++;
+        return new Response('{"error":{"message":"insufficient_quota: add credits"}}', { status: 429 });
+      },
+      baseUrl: 'https://api.openai.com/v1',
+      wait: async ms => waits.push(ms)
+    });
+    try { await collect(quotaProvider, { model: 'gpt-5-luna', messages: [] }); } catch (_) {}
+    A.eq(posts, 1, 'an exhausted OpenAI quota is terminal, not a rate-limit retry');
+    A.eq(waits, [], 'quota exhaustion does not wait or retry');
+  }
+
   // tool-call streaming
   {
     const fetchImpl = async () => {
@@ -301,6 +366,31 @@ module.exports = (async () => {
     await collect(p, { model: 'm', messages: [] });
     A.eq(posts().length, 3, 'drop is remembered per model - later calls skip the param up front');
     A.eq(JSON.parse(posts()[2].init.body).stream_options, undefined, 'remembered drop keeps the param off the wire');
+  }
+
+  // Some OpenAI-compatible reasoning models support function tools only when reasoning is explicitly disabled.
+  // Preserve the tool call and retry with `none`, rather than omitting the field and silently relying on a default.
+  {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      if (!init || init.method !== 'POST') return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      const body = JSON.parse(init.body);
+      calls.push(body);
+      if (body.reasoning_effort !== 'none') {
+        return new Response(JSON.stringify({ error: { message: 'Function tools with reasoning_effort are not supported for gpt-6-luna in /v1/chat/completions. To use function tools, set reasoning_effort to none.' } }), { status: 400 });
+      }
+      return new Response('data: [DONE]\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const p = makeOpenAICompatibleProvider({ fetch: fetchImpl, baseUrl: 'http://local/v1', reasoningEffort: 'medium', sendReasoningEffort: true });
+    const tools = [{ type: 'function', function: { name: 'team_dispatch', parameters: { type: 'object' } } }];
+    await collect(p, { model: 'gpt-6-luna', messages: [], tools, reasoningEffort: 'medium' });
+    A.eq(calls.length, 2, 'reasoning/tool incompatibility retries once');
+    A.eq(calls[0].reasoning_effort, 'medium', 'the initial request preserves the selected effort');
+    A.eq(calls[1].reasoning_effort, 'none', 'the compatibility retry explicitly disables reasoning');
+    A.eq(calls[1].tools.length, 1, 'the compatibility retry preserves function tools');
+    await collect(p, { model: 'gpt-6-luna', messages: [], tools, reasoningEffort: 'medium' });
+    A.eq(calls.length, 3, 'the none override is remembered for this model');
+    A.eq(calls[2].reasoning_effort, 'none', 'subsequent tool calls use the remembered compatible effort');
   }
 
   // tools are NEVER silently dropped - a provider that rejects tools must fail the run honestly

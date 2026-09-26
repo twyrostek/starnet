@@ -3,6 +3,8 @@ const http = require('node:http');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function startOverseerProvider(options = {}) {
   let reviews = 0;
+  let failNextReview = false;
+  let failNextWorker = false;
   const requests = [];
   const mock = http.createServer(async (req, res) => {
     if (req.url.includes('/models')) {
@@ -23,8 +25,24 @@ async function startOverseerProvider(options = {}) {
     const workerId = crew ? crew[1] : 'researcher';
     if (!parsed.tools || !parsed.tools.length) send({ content: 'Ready.' });
     else if (String(user && user.content).includes('DIRECT_PROOF')) send({ content: 'Direct specialist answer.' });
-    else if (String(user && user.content).startsWith('Review the background work')) { reviews++; if (options.reviewDelay) await sleep(options.reviewDelay); send({ content: /"status"\s*:\s*"interrupted"/.test(user.content) ? 'The crew’s work was stopped. I’ll wait for your next direction.' : 'Reviewed findings: the worker returned two observations.' }); }
-    else if (String(user && user.content).includes('WORKER_PROOF')) { await sleep(options.workerDelay || 800); send({ content: 'WORKER_FINDINGS: two verified observations.' }); }
+    else if (String(user && user.content).startsWith('Review the background work')) {
+      reviews++;
+      if (failNextReview) {
+        failNextReview = false;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'mock review request rejected', code: 'invalid_request_error' } }));
+      }
+      if (options.reviewDelay) await sleep(options.reviewDelay);
+      send({ content: /"status"\s*:\s*"interrupted"/.test(user.content) ? 'The crew’s work was stopped. I’ll wait for your next direction.' : 'Reviewed findings: the worker returned two observations.' });
+    }
+    else if (String(user && user.content).includes('WORKER_PROOF')) {
+      if (failNextWorker) {
+        failNextWorker = false;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'mock worker request rejected', code: 'invalid_request_error' } }));
+      }
+      await sleep(options.workerDelay || 800); send({ content: 'WORKER_FINDINGS: two verified observations.' });
+    }
     else if (String(user && user.content).startsWith('Review the project brief and identify')) { await sleep(options.workerDelay || 800); send({ content: 'The project needs a clear audience and a small first milestone. Start with the core workflow, then test it with one user.' }); }
     else if (system.includes('[PROJECT WORKSPACE]')) {
       if (!tools.includes('brief_proceed')) call('brief_proceed', { objective: 'Review this project with the station crew', deliverable: 'A concise project recommendation' });
@@ -44,6 +62,7 @@ async function startOverseerProvider(options = {}) {
     res.end('data: [DONE]\n\n');
   });
   await new Promise(resolve => mock.listen(0, '127.0.0.1', resolve));
-  return { server: mock, requests, reviews: () => reviews };
+  return { server: mock, requests, reviews: () => reviews,
+    failNextReview: () => { failNextReview = true; }, failNextWorker: () => { failNextWorker = true; } };
 }
 module.exports = { startOverseerProvider };

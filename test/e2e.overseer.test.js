@@ -5,6 +5,38 @@ const path = require('node:path');
 const { SidecarFixture } = require('./helpers/sidecar-fixture.js');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+async function watchStationDeliveries(fixture) {
+  const controller = new AbortController();
+  const response = await fixture.request('/api/channels/events?token=' + encodeURIComponent(fixture.token), { signal: controller.signal });
+  assert.equal(response.status, 200, 'station event stream opens for delivery acknowledgement');
+  const commands = [];
+  const reader = response.body.getReader();
+  const consume = async () => {
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline).trim(); buffer = buffer.slice(newline + 1);
+          if (!line.startsWith('data:')) continue;
+          let event;
+          try { event = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
+          const command = event && event.name === 'station.command' && event.payload;
+          if (!command || command.verb !== 'station.deliver') continue;
+          commands.push(command);
+          await fixture.json('POST', '/api/station/ack', { id: command.id, ok: true, result: { folded: true } });
+        }
+      }
+    } catch (_) {}
+  };
+  consume();
+  return { commands, close: () => controller.abort() };
+}
+
 (async () => {
   const provider = await require('./helpers/overseer-provider.js').startOverseerProvider({ reviewDelay: 1500 });
   const mock = provider.server;
@@ -27,6 +59,15 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     const response = await fixture.json('POST', '/api/run', { model: 'test/model', agentId: 'agent', streamId: 'home', isTask: true,
       messages: [{ role: 'user', content: 'Delegate research and review the findings' }] });
     assert.equal(response.status, 200);
+    const initialLeadRequests = provider.requests.filter(messages => {
+      const user = messages.filter(m => m.role === 'user').pop();
+      return user && /Delegate research and review the findings/.test(user.content);
+    });
+    assert.equal(initialLeadRequests.length, 3, 'the lead ends after dispatch instead of taking another model turn on the same work');
+    const leadRequest = provider.requests.find(messages => messages.some(m => m.role === 'user' && /Delegate research and review the findings/.test(m.content)));
+    const leadSystem = (leadRequest || []).filter(m => m.role === 'system').map(m => m.content).join('\n');
+    assert.match(leadSystem, /only handle a delegable task directly when the Commander explicitly tells you to do it yourself/i,
+      'coordinator prompt makes explicit Commander direction the only solo-work exception');
     const reviewStartedDeadline = Date.now() + 18000;
     while (provider.reviews() === 0 && Date.now() < reviewStartedDeadline) await sleep(25);
     assert.equal(provider.reviews(), 1, 'automatic review has reached the provider');
@@ -73,19 +114,43 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     snapshot = (await fixture.json('GET', '/api/overseer')).body;
     assert.ok(snapshot.threads.some(w => w.id === childId), 'child identity survives restart');
     assert.equal(snapshot.reviews[0].status, 'done'); assert.equal(provider.reviews(), 1, 'restart does not re-run completed review');
+    provider.failNextReview();
     const followup = await fixture.json('POST', '/api/run', { model: 'test/model', agentId: 'agent', streamId: 'home', isTask: true,
       messages: [{ role: 'user', content: 'Follow up in the existing research thread' }] });
     assert.equal(followup.status, 200);
+    const deliveryFeed = await watchStationDeliveries(fixture);
     const followupDeadline = Date.now() + 18000;
     while (Date.now() < followupDeadline) {
       snapshot = (await fixture.json('GET', '/api/overseer')).body;
-      if (snapshot.reviews.filter(r => r.status === 'done').length === 2) break;
+      if (snapshot.reviews.some(r => r.fallbackReport && r.fallbackReport.state === 'delivered')) break;
       await sleep(100);
     }
-    assert.equal(snapshot.reviews.filter(r => r.status === 'done').length, 2);
+    assert.equal(snapshot.reviews.filter(r => r.status === 'done').length, 1);
+    assert.equal(snapshot.reviews[1].status, 'interrupted', 'worker and review provider failures do not masquerade as a successful review');
+    assert.equal(snapshot.reviews[1].fallbackReport.state, 'delivered', 'the worker outcome is durably reported when review fails');
+    const fallback = deliveryFeed.commands.find(c => c.args && c.args.streamId === 'home' && /unreviewed/i.test(c.args.text));
+    assert.ok(fallback, 'a deterministic worker report is delivered to the Commander\'s parent conversation');
+    assert.match(fallback.args.text, /Task status: done/, 'the fallback reports successful worker completion');
+    assert.match(fallback.args.text, /WORKER_FINDINGS: two verified observations\./, 'the fallback includes the completed worker output');
     assert.equal(snapshot.threads.filter(w => w.parentStreamId === 'home').length, 1, 'follow-up reuses the child identity');
     const continued = provider.requests.find(messages => messages.some(m => m.role === 'user' && /continue from your previous findings/.test(m.content)));
     assert.ok(continued && continued.some(m => m.role === 'assistant' && /WORKER_FINDINGS/.test(m.content)), 'continued worker receives its durable prior answer');
+    provider.failNextWorker();
+    const failedWorkerRun = await fixture.json('POST', '/api/run', { model: 'test/model', agentId: 'agent', streamId: 'home', isTask: true,
+      messages: [{ role: 'user', content: 'Follow up in the existing research thread' }] });
+    assert.equal(failedWorkerRun.status, 200);
+    const failedWorkerDeadline = Date.now() + 18000;
+    while (Date.now() < failedWorkerDeadline) {
+      snapshot = (await fixture.json('GET', '/api/overseer')).body;
+      if (snapshot.reviews[2] && snapshot.reviews[2].fallbackReport && snapshot.reviews[2].fallbackReport.state === 'delivered') break;
+      await sleep(100);
+    }
+    assert.equal(snapshot.reviews[2].status, 'interrupted', 'a failed worker does not enter review as if it succeeded');
+    assert.equal(snapshot.reviews[2].fallbackReport.state, 'delivered', 'worker failure is reported without depending on another model call');
+    const workerFailureReport = deliveryFeed.commands.find(c => c.args && c.args.streamId === 'home' && /mock worker request rejected/.test(c.args.text));
+    assert.ok(workerFailureReport, 'Commander receives the failed worker\'s concrete provider error');
+    assert.equal(provider.reviews(), 2, 'the failed worker outcome is surfaced without spending a review call');
+    deliveryFeed.close();
     await fixture.stop();
     const statePath = path.join(fixture.workspace, 'overseer.json');
     const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
